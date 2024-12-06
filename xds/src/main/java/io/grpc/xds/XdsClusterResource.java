@@ -30,7 +30,6 @@ import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import com.google.protobuf.Struct;
-import com.google.protobuf.Value;
 import com.google.protobuf.util.Durations;
 import io.envoyproxy.envoy.config.cluster.v3.CircuitBreakers.Thresholds;
 import io.envoyproxy.envoy.config.cluster.v3.Cluster;
@@ -38,7 +37,6 @@ import io.envoyproxy.envoy.config.core.v3.Metadata;
 import io.envoyproxy.envoy.config.core.v3.RoutingPriority;
 import io.envoyproxy.envoy.config.core.v3.SocketAddress;
 import io.envoyproxy.envoy.config.endpoint.v3.ClusterLoadAssignment;
-import io.envoyproxy.envoy.extensions.filters.http.gcp_authn.v3.Audience;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CertificateValidationContext;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CommonTlsContext;
 import io.grpc.LoadBalancerRegistry;
@@ -46,19 +44,18 @@ import io.grpc.NameResolver;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.ServiceConfigUtil;
 import io.grpc.internal.ServiceConfigUtil.LbConfig;
+import io.grpc.util.ProtobufJsonConverter;
+import io.grpc.xds.ClusterMetadataRegistry.ClusterMetadataValueParser;
 import io.grpc.xds.EnvoyServerProtoData.OutlierDetection;
 import io.grpc.xds.EnvoyServerProtoData.UpstreamTlsContext;
 import io.grpc.xds.XdsClusterResource.CdsUpdate;
-import io.grpc.xds.XdsClusterResource.MetadataRegistry.MetadataValueParser;
 import io.grpc.xds.client.XdsClient.ResourceUpdate;
 import io.grpc.xds.client.XdsResourceType;
 import io.grpc.xds.internal.security.CommonTlsContextUtil;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 class XdsClusterResource extends XdsResourceType<CdsUpdate> {
@@ -192,12 +189,12 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
       throws InvalidProtocolBufferException {
     ImmutableMap.Builder<String, Object> parsedMetadata = ImmutableMap.builder();
 
-    MetadataRegistry registry = MetadataRegistry.getInstance();
+    ClusterMetadataRegistry registry = ClusterMetadataRegistry.getInstance();
     // Process typed_filter_metadata
     for (Map.Entry<String, Any> entry : metadata.getTypedFilterMetadataMap().entrySet()) {
       String key = entry.getKey();
       Any value = entry.getValue();
-      MetadataValueParser parser = registry.findParser(value.getTypeUrl());
+      ClusterMetadataValueParser parser = registry.findParser(value.getTypeUrl());
       if (parser != null) {
         Object parsedValue = parser.parse(value);
         if (parsedValue == null) {
@@ -213,41 +210,12 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
       String key = entry.getKey();
       if (!parsedMetadata.build().containsKey(key)) {
         Struct structValue = entry.getValue();
-        Object jsonValue = convertToJson(structValue);
+        Object jsonValue = ProtobufJsonConverter.convertToJson(structValue);
         parsedMetadata.put(key, jsonValue);
       }
     }
 
     return parsedMetadata.build();
-  }
-
-  private static Map<String, Object> convertToJson(Struct struct) {
-    Map<String, Object> result = new HashMap<>();
-    for (Map.Entry<String, Value> entry : struct.getFieldsMap().entrySet()) {
-      result.put(entry.getKey(), convertValue(entry.getValue()));
-    }
-    return result;
-  }
-
-  private static Object convertValue(Value value) {
-    switch (value.getKindCase()) {
-      case STRUCT_VALUE:
-        return convertToJson(value.getStructValue());
-      case LIST_VALUE:
-        return value.getListValue().getValuesList().stream()
-            .map(val -> XdsClusterResource.convertValue(val))
-            .collect(Collectors.toList());
-      case NUMBER_VALUE:
-        return value.getNumberValue();
-      case STRING_VALUE:
-        return value.getStringValue();
-      case BOOL_VALUE:
-        return value.getBoolValue();
-      case NULL_VALUE:
-        return null;
-      default:
-        throw new IllegalArgumentException("Unknown Value type: " + value.getKindCase());
-    }
   }
 
   private static StructOrError<CdsUpdate.Builder> parseAggregateCluster(Cluster cluster) {
@@ -780,53 +748,6 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
       abstract Builder parsedMetadata(ImmutableMap<String, Object> parsedMetadata);
 
       abstract CdsUpdate build();
-    }
-  }
-
-  public static final class MetadataRegistry {
-
-    private static final MetadataRegistry instance = new MetadataRegistry();
-
-    static {
-      getInstance().registerParser(
-          "extensions.filters.http.gcp_authn.v3.Audience", new AudienceMetadataParser());
-    }
-
-    private MetadataRegistry() {}
-
-    public static MetadataRegistry getInstance() {
-      return instance;
-    }
-
-    private final Map<String, MetadataValueParser> parsers = new HashMap<>();
-
-    public void registerParser(String typeUrl, MetadataValueParser parser) {
-      parsers.put(typeUrl, parser);
-    }
-
-    public MetadataValueParser findParser(String typeUrl) {
-      return parsers.get(typeUrl);
-    }
-
-    @FunctionalInterface
-    public interface MetadataValueParser {
-      Object parse(Any any) throws InvalidProtocolBufferException;
-    }
-
-    public static class AudienceMetadataParser implements MetadataValueParser {
-      @Override
-      public String parse(Any any) throws InvalidProtocolBufferException {
-        if (any.is(Audience.class)) {
-          Audience audience = any.unpack(Audience.class);
-          String url = audience.getUrl();
-          if (url.isEmpty()) {
-            throw new InvalidProtocolBufferException("Audience URL is empty.");
-          }
-          return url;
-        } else {
-          throw new InvalidProtocolBufferException("Unexpected message type: " + any.getTypeUrl());
-        }
-      }
     }
   }
 }
