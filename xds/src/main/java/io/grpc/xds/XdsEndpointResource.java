@@ -17,23 +17,29 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static io.grpc.xds.MetadataParser.parseMetadata;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.ImmutableMap;
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.envoyproxy.envoy.config.core.v3.Address;
 import io.envoyproxy.envoy.config.core.v3.HealthStatus;
+import io.envoyproxy.envoy.config.core.v3.Metadata;
 import io.envoyproxy.envoy.config.endpoint.v3.ClusterLoadAssignment;
 import io.envoyproxy.envoy.config.endpoint.v3.Endpoint;
 import io.envoyproxy.envoy.type.v3.FractionalPercent;
 import io.grpc.EquivalentAddressGroup;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.xds.Endpoints.DropOverload;
+import io.grpc.xds.Endpoints.LbEndpoint;
 import io.grpc.xds.Endpoints.LocalityLbEndpoints;
 import io.grpc.xds.XdsEndpointResource.EdsUpdate;
 import io.grpc.xds.client.Locality;
 import io.grpc.xds.client.XdsClient.ResourceUpdate;
 import io.grpc.xds.client.XdsResourceType;
+import io.grpc.xds.internal.ProtobufJsonConverter;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -185,7 +191,8 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
   @VisibleForTesting
   @Nullable
   static StructOrError<LocalityLbEndpoints> parseLocalityLbEndpoints(
-      io.envoyproxy.envoy.config.endpoint.v3.LocalityLbEndpoints proto) {
+      io.envoyproxy.envoy.config.endpoint.v3.LocalityLbEndpoints proto)
+      throws ResourceInvalidException {
     // Filter out localities without or with 0 weight.
     if (!proto.hasLoadBalancingWeight() || proto.getLoadBalancingWeight().getValue() < 1) {
       return null;
@@ -193,12 +200,28 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
     if (proto.getPriority() < 0) {
       return StructOrError.fromError("negative priority");
     }
+
+    ImmutableMap<String, Object> localityMetadata;
+    try {
+      localityMetadata = parseMetadata(proto.getMetadata());
+    } catch (InvalidProtocolBufferException e) {
+      throw new ResourceInvalidException("Failed to parse Locality Endpoint metadata: "
+          + e.getMessage(), e);
+    }
+
     List<Endpoints.LbEndpoint> endpoints = new ArrayList<>(proto.getLbEndpointsCount());
     for (io.envoyproxy.envoy.config.endpoint.v3.LbEndpoint endpoint : proto.getLbEndpointsList()) {
       // The endpoint field of each lb_endpoints must be set.
       // Inside of it: the address field must be set.
       if (!endpoint.hasEndpoint() || !endpoint.getEndpoint().hasAddress()) {
         return StructOrError.fromError("LbEndpoint with no endpoint/address");
+      }
+      ImmutableMap<String, Object> endpointMetadata;
+      try {
+        endpointMetadata = parseMetadata(endpoint.getMetadata());
+      } catch (InvalidProtocolBufferException e) {
+        throw new ResourceInvalidException("Failed to parse Endpoint metadata: "
+            + e.getMessage(), e);
       }
       List<java.net.SocketAddress> addresses = new ArrayList<>();
       addresses.add(getInetSocketAddress(endpoint.getEndpoint().getAddress()));
@@ -214,10 +237,11 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
       endpoints.add(Endpoints.LbEndpoint.create(
           new EquivalentAddressGroup(addresses),
           endpoint.getLoadBalancingWeight().getValue(), isHealthy,
-          endpoint.getEndpoint().getHostname()));
+          endpoint.getEndpoint().getHostname(),
+          endpointMetadata));
     }
     return StructOrError.fromStruct(Endpoints.LocalityLbEndpoints.create(
-        endpoints, proto.getLoadBalancingWeight().getValue(), proto.getPriority()));
+        endpoints, proto.getLoadBalancingWeight().getValue(), proto.getPriority(), localityMetadata));
   }
 
   private static InetSocketAddress getInetSocketAddress(Address address) {

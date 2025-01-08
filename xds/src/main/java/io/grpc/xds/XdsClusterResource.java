@@ -17,6 +17,7 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static io.grpc.xds.MetadataParser.parseMetadata;
 import static io.grpc.xds.client.Bootstrapper.ServerInfo;
 
 import com.google.auto.value.AutoValue;
@@ -174,6 +175,16 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
     updateBuilder.lbPolicyConfig(lbPolicyConfig);
     updateBuilder.filterMetadata(
         ImmutableMap.copyOf(cluster.getMetadata().getFilterMetadataMap()));
+
+    try {
+      ImmutableMap<String, Object> parsedFilterMetadata =
+          parseMetadata(cluster.getMetadata());
+      updateBuilder.parsedMetadata(parsedFilterMetadata);
+    } catch (InvalidProtocolBufferException e) {
+      throw new ResourceInvalidException(
+          "Failed to parse xDS filter metadata for cluster '" + cluster.getName() + "': "
+              + e.getMessage(), e);
+    }
 
     return updateBuilder.build();
   }
@@ -610,6 +621,8 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
 
     abstract ImmutableMap<String, Struct> filterMetadata();
 
+    abstract ImmutableMap<String, Object> parsedMetadata();
+
     private static Builder newBuilder(String clusterName) {
       return new AutoValue_XdsClusterResource_CdsUpdate.Builder()
           .clusterName(clusterName)
@@ -617,6 +630,7 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
           .maxRingSize(0)
           .choiceCount(0)
           .filterMetadata(ImmutableMap.of())
+          .parsedMetadata(ImmutableMap.of())
           .isHttp11ProxyEnabled(false);
     }
 
@@ -741,6 +755,8 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
       protected abstract Builder outlierDetection(OutlierDetection outlierDetection);
 
       protected abstract Builder filterMetadata(ImmutableMap<String, Struct> filterMetadata);
+
+      protected abstract Builder parsedMetadata(ImmutableMap<String, Object> parsedMetadata);
 
       abstract CdsUpdate build();
     }
