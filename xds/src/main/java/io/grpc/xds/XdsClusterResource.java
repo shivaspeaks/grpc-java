@@ -17,7 +17,7 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.MetadataParser.parseMetadata;
+import static io.grpc.xds.MetadataRegistry.parseMetadata;
 import static io.grpc.xds.client.Bootstrapper.ServerInfo;
 
 import com.google.auto.value.AutoValue;

@@ -44,13 +44,13 @@ final class Endpoints {
     // Locality's priority level.
     abstract int priority();
 
-    abstract ImmutableMap<String, Object> localityMetadataMap();
+    abstract ImmutableMap<String, Object> localityMetadata();
 
     static LocalityLbEndpoints create(List<LbEndpoint> endpoints, int localityWeight,
-        int priority, ImmutableMap<String, Object> localityMetadataMap) {
+        int priority, ImmutableMap<String, Object> localityMetadata) {
       checkArgument(localityWeight > 0, "localityWeight must be greater than 0");
       return new AutoValue_Endpoints_LocalityLbEndpoints(
-          ImmutableList.copyOf(endpoints), localityWeight, priority, localityMetadataMap);
+          ImmutableList.copyOf(endpoints), localityWeight, priority, localityMetadata);
     }
   }
 
