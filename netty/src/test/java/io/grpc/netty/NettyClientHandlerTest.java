@@ -1182,6 +1182,11 @@ public class NettyClientHandlerTest extends NettyHandlerTestBase<NettyClientHand
       invocationCount++;
       this.failureCause = cause;
     }
+
+    @Override
+    public void onFailure(Status cause) {
+      invocationCount++;
+    }
   }
 
   private static class TransportStateImpl extends NettyClientStream.TransportState {

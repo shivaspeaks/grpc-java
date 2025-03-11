@@ -279,6 +279,12 @@ public class KeepAliveManager {
           transport.shutdownNow(Status.UNAVAILABLE.withDescription(
               "Keepalive failed. The connection is likely gone"));
         }
+
+        @Override
+        public void onFailure(Status cause) {
+          transport.shutdownNow(Status.UNAVAILABLE.withDescription(
+              "Keepalive failed. The connection is likely gone"));
+        }
       }, MoreExecutors.directExecutor());
     }
 

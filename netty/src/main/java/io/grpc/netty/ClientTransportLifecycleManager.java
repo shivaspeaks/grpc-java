@@ -30,7 +30,6 @@ final class ClientTransportLifecycleManager {
   /** null iff !transportShutdown. */
   private Status shutdownStatus;
   /** null iff !transportShutdown. */
-  private Throwable shutdownThrowable;
   private boolean transportTerminated;
 
   public ClientTransportLifecycleManager(ManagedClientTransport.Listener listener) {
@@ -72,7 +71,6 @@ final class ClientTransportLifecycleManager {
       return false;
     }
     shutdownStatus = s;
-    shutdownThrowable = s.asException();
     return true;
   }
 
@@ -95,9 +93,5 @@ final class ClientTransportLifecycleManager {
 
   public Status getShutdownStatus() {
     return shutdownStatus;
-  }
-
-  public Throwable getShutdownThrowable() {
-    return shutdownThrowable;
   }
 }

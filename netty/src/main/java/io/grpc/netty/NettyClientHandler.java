@@ -499,7 +499,7 @@ class NettyClientHandler extends AbstractNettyHandler {
         streamStatus = lifecycleManager.getShutdownStatus();
       }
       try {
-        cancelPing(lifecycleManager.getShutdownThrowable());
+        cancelPing(lifecycleManager.getShutdownStatus());
         // Report status to the application layer for any open streams
         connection().forEachActiveStream(new Http2StreamVisitor() {
           @Override
@@ -593,13 +593,13 @@ class NettyClientHandler extends AbstractNettyHandler {
    */
   private void createStream(CreateStreamCommand command, ChannelPromise promise)
           throws Exception {
-    if (lifecycleManager.getShutdownThrowable() != null) {
+    if (lifecycleManager.getShutdownStatus() != null) {
       command.stream().setNonExistent();
       // The connection is going away (it is really the GOAWAY case),
       // just terminate the stream now.
       command.stream().transportReportStatus(
           lifecycleManager.getShutdownStatus(), RpcProgress.MISCARRIED, true, new Metadata());
-      promise.setFailure(lifecycleManager.getShutdownThrowable());
+      promise.setFailure(lifecycleManager.getShutdownStatus().asException());
       return;
     }
 
@@ -854,14 +854,14 @@ class NettyClientHandler extends AbstractNettyHandler {
           transportTracer.reportKeepAliveSent();
         } else {
           Throwable cause = future.cause();
+          Status s = lifecycleManager.getShutdownStatus();
           if (cause instanceof ClosedChannelException) {
-            cause = lifecycleManager.getShutdownThrowable();
             if (cause == null) {
-              cause = Status.UNKNOWN.withDescription("Ping failed but for unknown reason.")
-                  .withCause(future.cause()).asException();
+              s = Status.UNKNOWN.withDescription("Ping failed but for unknown reason.")
+                  .withCause(future.cause());
             }
           }
-          finalPing.failed(cause);
+          finalPing.failed(s);
           if (ping == finalPing) {
             ping = null;
           }
@@ -963,7 +963,7 @@ class NettyClientHandler extends AbstractNettyHandler {
     }
   }
 
-  private void cancelPing(Throwable t) {
+  private void cancelPing(Status t) {
     if (ping != null) {
       ping.failed(t);
       ping = null;
