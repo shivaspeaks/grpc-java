@@ -17,6 +17,8 @@
 package io.grpc.xds;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -24,6 +26,7 @@ import static org.mockito.Mockito.verify;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.grpc.MetricRecorder;
+import io.grpc.Status;
 import io.grpc.internal.ObjectPool;
 import io.grpc.xds.Filter.NamedFilterConfig;
 import io.grpc.xds.XdsListenerResource.LdsUpdate;
@@ -105,24 +108,30 @@ public class XdsClientFederationTest {
     xdsClient.watchXdsResource(XdsListenerResource.getInstance(),
         "xdstp://server-one/envoy.config.listener.v3.Listener/test-server", mockDirectPathWatcher);
 
-    verify(mockWatcher, timeout(10000)).onChanged(
-        LdsUpdate.forApiListener(
-            HttpConnectionManager.forRdsName(0, "route-config.googleapis.com", ImmutableList.of(
-                new NamedFilterConfig("terminal-filter", RouterFilter.ROUTER_CONFIG)))));
-    verify(mockDirectPathWatcher, timeout(10000)).onChanged(
-        LdsUpdate.forApiListener(
-            HttpConnectionManager.forRdsName(0, "route-config.googleapis.com", ImmutableList.of(
-                new NamedFilterConfig("terminal-filter", RouterFilter.ROUTER_CONFIG)))));
+    verify(mockWatcher, timeout(10000)).onResourceChanged(argThat(statusOr ->
+        statusOr.getValue().equals(
+            LdsUpdate.forApiListener(
+                HttpConnectionManager.forRdsName(0, "route-config.googleapis.com", ImmutableList.of(
+                    new NamedFilterConfig("terminal-filter", RouterFilter.ROUTER_CONFIG)))))));
 
-    // By setting the LDS config with a new server name we effectively make the old server to go
-    // away as it is not in the configuration anymore. This change in one control plane (here the
-    // "normal TrafficDirector" one) should not trigger an onResourceDoesNotExist() call on a
-    // watcher of another control plane (here the DirectPath one).
+    verify(mockDirectPathWatcher, timeout(10000)).onResourceChanged(argThat(statusOr ->
+        statusOr.getValue().equals(
+            LdsUpdate.forApiListener(
+                HttpConnectionManager.forRdsName(0, "route-config.googleapis.com", ImmutableList.of(
+                    new NamedFilterConfig("terminal-filter", RouterFilter.ROUTER_CONFIG)))))));
+
+    // This change in one control plane ("TrafficDirector") causes test-server to be removed,
+    // but it should not affect the DirectPath watcher.
     trafficdirector.setLdsConfig(ControlPlaneRule.buildServerListener(),
         ControlPlaneRule.buildClientListener("new-server"));
-    verify(mockWatcher, timeout(20000)).onResourceDoesNotExist("test-server");
-    verify(mockDirectPathWatcher, times(0)).onResourceDoesNotExist(
-        "xdstp://server-one/envoy.config.listener.v3.Listener/test-server");
+
+    verify(mockWatcher, timeout(20000)).onResourceChanged(argThat(statusOr ->
+        !statusOr.hasValue() && statusOr.getStatus().getCode() == Status.Code.NOT_FOUND &&
+            statusOr.getStatus().getDescription().contains("test-server")));
+
+    verify(mockDirectPathWatcher, after(20000).never()).onResourceChanged(argThat(statusOr ->
+        !statusOr.hasValue() && statusOr.getStatus().getCode() == Status.Code.NOT_FOUND &&
+            statusOr.getStatus().getDescription().contains("test-server")));
   }
 
   /**

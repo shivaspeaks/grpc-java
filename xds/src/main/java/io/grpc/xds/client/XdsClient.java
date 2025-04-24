@@ -27,6 +27,7 @@ import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.Any;
 import io.grpc.ExperimentalApi;
 import io.grpc.Status;
+import io.grpc.StatusOr;
 import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -127,8 +128,16 @@ public abstract class XdsClient {
   public interface ResourceWatcher<T extends ResourceUpdate> {
 
     /**
-     * Called when the resource discovery RPC encounters some transient error.
+     * Called when a new version of the resource is received, or when the resource becomes invalid.
      *
+     * <p>If an error is passed, the watcher must stop using the resource and treat it as non-existent.
+     */
+    void onResourceChanged(StatusOr<T> update);
+
+    /**
+     * Called for ambient errors (e.g., connection lost to xDS server). The watcher may retain its current state.
+     *
+     * <p>This error can be cleared by another call to onAmbientError() with OK, or a new onResourceChanged().
      * <p>Note that we expect that the implementer to:
      * - Comply with the guarantee to not generate certain statuses by the library:
      *   https://grpc.github.io/grpc/core/md_doc_statuscodes.html. If the code needs to be
@@ -136,16 +145,7 @@ public abstract class XdsClient {
      * - Keep {@link Status} description in one form or another, as it contains valuable debugging
      *   information.
      */
-    void onError(Status error);
-
-    /**
-     * Called when the requested resource is not available.
-     *
-     * @param resourceName name of the resource requested in discovery request.
-     */
-    void onResourceDoesNotExist(String resourceName);
-
-    void onChanged(T update);
+    void onAmbientError(Status status);
   }
 
   /**

@@ -1300,20 +1300,28 @@ public class ClusterResolverLoadBalancerTest {
     void deliverClusterLoadAssignment(String resource, List<DropOverload> dropOverloads,
         Map<Locality, LocalityLbEndpoints> localityLbEndpointsMap) {
       if (watchers.containsKey(resource)) {
-        watchers.get(resource).onChanged(
-            new XdsEndpointResource.EdsUpdate(resource, localityLbEndpointsMap, dropOverloads));
+        // Create the update
+        EdsUpdate update = new XdsEndpointResource.EdsUpdate(resource, localityLbEndpointsMap, dropOverloads);
+
+        // Deliver the resource using StatusOr
+        watchers.get(resource).onResourceChanged(StatusOr.fromValue(update));
       }
     }
 
     void deliverResourceNotFound(String resource) {
       if (watchers.containsKey(resource)) {
-        watchers.get(resource).onResourceDoesNotExist(resource);
+        // Create a NOT_FOUND status
+        Status status = Status.NOT_FOUND.withDescription("Resource " + resource + " does not exist");
+
+        // Deliver the error using StatusOr
+        watchers.get(resource).onResourceChanged(StatusOr.fromStatus(status));
       }
     }
 
     void deliverError(Status error) {
       for (ResourceWatcher<EdsUpdate> watcher : watchers.values()) {
-        watcher.onError(error);
+        // Deliver the error using OnAmbientError pattern
+        watcher.onAmbientError(error);
       }
     }
   }

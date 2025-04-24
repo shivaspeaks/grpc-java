@@ -33,6 +33,7 @@ import io.grpc.LoadBalancerRegistry;
 import io.grpc.NameResolver;
 import io.grpc.NameResolver.ResolutionResult;
 import io.grpc.Status;
+import io.grpc.StatusOr;
 import io.grpc.SynchronizationContext;
 import io.grpc.SynchronizationContext.ScheduledHandle;
 import io.grpc.internal.BackoffPolicy;
@@ -393,13 +394,28 @@ final class ClusterResolverLoadBalancer extends LoadBalancer {
       }
 
       @Override
-      public void onChanged(final EdsUpdate update) {
+      public void onResourceChanged(final StatusOr<EdsUpdate> resourceUpdate) {
+        if (shutdown) {
+          return;
+        }
+
+        if (!resourceUpdate.getStatus().isOk()) {
+          Status error = resourceUpdate.getStatus();
+          String resourceName = edsServiceName != null ? edsServiceName : name;
+          status = Status.UNAVAILABLE
+              .withDescription(String.format("Unable to load EDS %s. xDS server returned: %s: %s",
+                  resourceName, error.getCode(), error.getDescription()))
+              .withCause(error.getCause());
+          logger.log(XdsLogLevel.WARNING, "Received EDS error: {0}", error);
+          handleEndpointResolutionError();
+          return;
+        }
+
+        final EdsUpdate update = resourceUpdate.getValue();
+
         class EndpointsUpdated implements Runnable {
           @Override
           public void run() {
-            if (shutdown) {
-              return;
-            }
             logger.log(XdsLogLevel.DEBUG, "Received endpoint update {0}", update);
             if (logger.isLoggable(XdsLogLevel.INFO)) {
               logger.log(XdsLogLevel.INFO, "Cluster {0}: {1} localities, {2} drop categories",
@@ -546,29 +562,20 @@ final class ClusterResolverLoadBalancer extends LoadBalancer {
       }
 
       @Override
-      public void onResourceDoesNotExist(final String resourceName) {
-        if (shutdown) {
-          return;
-        }
-        logger.log(XdsLogLevel.INFO, "Resource {0} unavailable", resourceName);
-        status = Status.OK;
-        resolved = true;
-        result = null;  // resource revoked
-        handleEndpointResourceUpdate();
-      }
-
-      @Override
-      public void onError(final Status error) {
-        if (shutdown) {
-          return;
-        }
-        String resourceName = edsServiceName != null ? edsServiceName : name;
-        status = Status.UNAVAILABLE
-            .withDescription(String.format("Unable to load EDS %s. xDS server returned: %s: %s",
-                  resourceName, error.getCode(), error.getDescription()))
-            .withCause(error.getCause());
-        logger.log(XdsLogLevel.WARNING, "Received EDS error: {0}", error);
-        handleEndpointResolutionError();
+      public void onAmbientError(final Status error) {
+        syncContext.execute(new Runnable() {
+          @Override
+          public void run() {
+            if (shutdown) {
+              return;
+            }
+            logger.log(XdsLogLevel.WARNING, "Received transient error from EDS resource: {0}", error);
+            status = Status.UNAVAILABLE
+                .withDescription("Transient error while watching EDS resource: " + error.getDescription())
+                .withCause(error.getCause());
+            handleEndpointResolutionError();
+          }
+        });
       }
     }
 

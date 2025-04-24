@@ -32,6 +32,7 @@ import io.grpc.InsecureServerCredentials;
 import io.grpc.ServerServiceDefinition;
 import io.grpc.Status;
 import io.grpc.StatusException;
+import io.grpc.StatusOr;
 import io.grpc.testing.GrpcCleanupRule;
 import io.grpc.xds.XdsServerTestHelper.FakeXdsClient;
 import io.grpc.xds.XdsServerTestHelper.FakeXdsClientPoolFactory;
@@ -191,23 +192,32 @@ public class XdsServerBuilderTest {
     buildServer(mockXdsServingStatusListener);
     Future<Throwable> future = startServerAsync();
     XdsServerTestHelper.generateListenerUpdate(
-            xdsClient,
-            CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1"),
-            tlsContextManager);
+        xdsClient,
+        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1"),
+        tlsContextManager);
     future.get(5000, TimeUnit.MILLISECONDS);
-    xdsClient.ldsWatcher.onError(Status.ABORTED);
+
+    // Triggering error with Status.ABORTED using onResourceChanged with StatusOr
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.ABORTED));
     verify(mockXdsServingStatusListener, never()).onNotServing(any(StatusException.class));
     reset(mockXdsServingStatusListener);
-    xdsClient.ldsWatcher.onError(Status.CANCELLED);
+
+    // Triggering error with Status.CANCELLED using onResourceChanged with StatusOr
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.CANCELLED));
     verify(mockXdsServingStatusListener, never()).onNotServing(any(StatusException.class));
     reset(mockXdsServingStatusListener);
-    xdsClient.ldsWatcher.onResourceDoesNotExist("not found error");
+
+    // Replacing onResourceDoesNotExist with onResourceChanged and wrapping with StatusOr for not found error
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("not found error")));
     verify(mockXdsServingStatusListener).onNotServing(any(StatusException.class));
     reset(mockXdsServingStatusListener);
+
+    // Generate listener update again
     XdsServerTestHelper.generateListenerUpdate(
         xdsClient,
         CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1"),
-            tlsContextManager);
+        tlsContextManager);
+
     verifyServer(null, mockXdsServingStatusListener, null);
   }
 
@@ -239,17 +249,28 @@ public class XdsServerBuilderTest {
         mock(XdsServerBuilder.XdsServingStatusListener.class);
     buildServer(mockXdsServingStatusListener);
     Future<Throwable> future = startServerAsync();
+
     XdsServerTestHelper.generateListenerUpdate(
         xdsClient,
         CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1"),
-            tlsContextManager);
+        tlsContextManager);
+
+    // Generate second listener update
     XdsServerTestHelper.generateListenerUpdate(
         xdsClient,
         CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1"),
-            tlsContextManager);
+        tlsContextManager);
+
+    // Ensure that `onNotServing` hasn't been called yet
     verify(mockXdsServingStatusListener, never()).onNotServing(any(Throwable.class));
+
+    // Verify server status after updates
     verifyServer(future, mockXdsServingStatusListener, null);
-    xdsClient.ldsWatcher.onError(Status.ABORTED);
+
+    // Triggering error with Status.ABORTED using onResourceChanged and StatusOr
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.ABORTED));
+
+    // Verify server status after error (status should be updated)
     verifyServer(null, mockXdsServingStatusListener, null);
   }
 

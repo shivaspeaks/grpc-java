@@ -48,6 +48,7 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.StatusException;
+import io.grpc.StatusOr;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.FakeClock;
 import io.grpc.testing.TestMethodDescriptors;
@@ -337,28 +338,44 @@ public class XdsServerWrapperTest {
         }
       }
     });
+
+    // Get the LDS resource
     String ldsResource = xdsClient.ldsResource.get(5, TimeUnit.SECONDS);
-    xdsClient.ldsWatcher.onResourceDoesNotExist(ldsResource);
+
+    // Trigger the onResourceDoesNotExist with StatusOr indicating resource not found
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("Resource not found")));
+
+    // Verify listener state
     verify(listener, timeout(5000)).onNotServing(any());
+
     try {
       start.get(START_WAIT_AFTER_LISTENER_MILLIS, TimeUnit.MILLISECONDS);
       fail("server should not start() successfully.");
     } catch (TimeoutException ex) {
-      // expect to block here.
+      // Expect to block here.
       assertThat(start.isDone()).isFalse();
     }
+
+    // Verifying mock server interactions
     verify(mockBuilder, times(1)).build();
     verify(mockServer, never()).start();
     verify(mockServer).shutdown();
+
     when(mockServer.isShutdown()).thenReturn(true);
     when(mockServer.isTerminated()).thenReturn(true);
+
     verify(listener, times(1)).onNotServing(any(Throwable.class));
+
+    // Shutdown sequence
     xdsServerWrapper.shutdown();
     assertThat(xdsServerWrapper.isShutdown()).isTrue();
     assertThat(xdsClient.ldsResource).isNull();
     assertThat(xdsClient.isShutDown()).isTrue();
+
     verify(mockBuilder, times(1)).build();
     verify(mockServer, times(1)).shutdown();
+
+    // Verify termination
     xdsServerWrapper.awaitTermination(1, TimeUnit.SECONDS);
     assertThat(xdsServerWrapper.isTerminated()).isTrue();
   }
@@ -510,30 +527,41 @@ public class XdsServerWrapperTest {
         }
       }
     });
+
+    // Retrieve the LDS resource
     String ldsResource = xdsClient.ldsResource.get(5, TimeUnit.SECONDS);
     assertThat(ldsResource).isEqualTo("grpc/server?udpa.resource.listening_address=0.0.0.0:1");
-    VirtualHost virtualHost =
-            VirtualHost.create(
-                    "virtual-host", Collections.singletonList("auth"), new ArrayList<Route>(),
-                    ImmutableMap.<String, FilterConfig>of());
+
+    // Create VirtualHost and HttpConnectionManager for testing
+    VirtualHost virtualHost = VirtualHost.create(
+        "virtual-host", Collections.singletonList("auth"), new ArrayList<Route>(),
+        ImmutableMap.<String, FilterConfig>of());
     HttpConnectionManager httpConnectionManager = HttpConnectionManager.forVirtualHosts(
-            0L, Collections.singletonList(virtualHost), new ArrayList<NamedFilterConfig>());
+        0L, Collections.singletonList(virtualHost), new ArrayList<NamedFilterConfig>());
     EnvoyServerProtoData.FilterChain filterChain = EnvoyServerProtoData.FilterChain.create(
-            "filter-chain-foo", createMatch(), httpConnectionManager, createTls(),
-            mock(TlsContextManager.class));
+        "filter-chain-foo", createMatch(), httpConnectionManager, createTls(),
+        mock(TlsContextManager.class));
+
+    // Deliver the initial LDS update
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain), null);
+
+    // Ensure the server starts and listener is in the correct state
     start.get(5000, TimeUnit.MILLISECONDS);
     verify(listener).onServing();
     verify(mockServer).start();
 
-    // server shutdown after resourceDoesNotExist
-    xdsClient.ldsWatcher.onResourceDoesNotExist(ldsResource);
+    // Simulate server shutdown after resource not found
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("Resource not found")));
+
+    // Verify the server shutdown
     verify(mockServer).shutdown();
 
-    // re-deliver lds resource
+    // Redeliver the LDS resource and check server restart
     reset(mockServer);
     reset(listener);
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain), null);
+
+    // Verify the listener state and server restart
     verify(listener).onServing();
     verify(mockServer).start();
   }
@@ -693,42 +721,59 @@ public class XdsServerWrapperTest {
         }
       }
     });
+
+    // Retrieve the LDS resource
     String ldsWatched = xdsClient.ldsResource.get(5, TimeUnit.SECONDS);
     assertThat(ldsWatched).isEqualTo("grpc/server?udpa.resource.listening_address=0.0.0.0:1");
+
+    // Create VirtualHost and HttpConnectionManager for testing
     VirtualHost virtualHost = createVirtualHost("virtual-host-0");
     HttpConnectionManager hcmVirtual = HttpConnectionManager.forVirtualHosts(
-            0L, Collections.singletonList(virtualHost), new ArrayList<NamedFilterConfig>());
+        0L, Collections.singletonList(virtualHost), new ArrayList<NamedFilterConfig>());
     EnvoyServerProtoData.FilterChain f0 = createFilterChain("filter-chain-0", hcmVirtual);
     EnvoyServerProtoData.FilterChain f1 = createFilterChain("filter-chain-1", createRds("r0"));
+
+    // Deliver initial LDS update
     xdsClient.deliverLdsUpdate(Arrays.asList(f0, f1), null);
     xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
-    xdsClient.rdsWatchers.get("r0").onError(Status.CANCELLED);
+
+    // Simulate RDS error using StatusOr by calling onResourceChanged with Status.CANCELLED
+    xdsClient.rdsWatchers.get("r0").onResourceChanged(StatusOr.fromStatus(Status.CANCELLED));
+
+    // Wait for the server to start
     start.get(5000, TimeUnit.MILLISECONDS);
-    assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size())
-        .isEqualTo(2);
-    ServerRoutingConfig realConfig =
-        selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(f1).get();
+
+    // Check routing config
+    assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size()).isEqualTo(2);
+
+    // Verify the routing config for filter chain f1
+    ServerRoutingConfig realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(f1).get();
     assertThat(realConfig.virtualHosts()).isEmpty();
     assertThat(realConfig.interceptors()).isEmpty();
 
+    // Verify the routing config for filter chain f0
     realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(f0).get();
     assertThat(realConfig.virtualHosts()).isEqualTo(hcmVirtual.virtualHosts());
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
-    xdsClient.deliverRdsUpdate("r0",
-            Collections.singletonList(createVirtualHost("virtual-host-1")));
+    // Deliver updated RDS data
+    xdsClient.deliverRdsUpdate("r0", Collections.singletonList(createVirtualHost("virtual-host-1")));
     realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(f1).get();
-    assertThat(realConfig.virtualHosts()).isEqualTo(
-        Collections.singletonList(createVirtualHost("virtual-host-1")));
+    assertThat(realConfig.virtualHosts()).isEqualTo(Collections.singletonList(createVirtualHost("virtual-host-1")));
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
-    xdsClient.rdsWatchers.get("r0").onError(Status.CANCELLED);
+    // Simulate another RDS error using StatusOr by calling onResourceChanged with Status.CANCELLED
+    xdsClient.rdsWatchers.get("r0").onResourceChanged(StatusOr.fromStatus(Status.CANCELLED));
+
+    // Check the updated routing config for f1 after the error
     realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(f1).get();
-    assertThat(realConfig.virtualHosts()).isEqualTo(
-        Collections.singletonList(createVirtualHost("virtual-host-1")));
+    assertThat(realConfig.virtualHosts()).isEqualTo(Collections.singletonList(createVirtualHost("virtual-host-1")));
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
-    xdsClient.rdsWatchers.get("r0").onResourceDoesNotExist("r0");
+    // Simulate RDS resource not found using StatusOr
+    xdsClient.rdsWatchers.get("r0").onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("Resource r0 not found")));
+
+    // Verify the routing config for f1 after the resource not found
     realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(f1).get();
     assertThat(realConfig.virtualHosts()).isEmpty();
     assertThat(realConfig.interceptors()).isEmpty();
@@ -747,37 +792,60 @@ public class XdsServerWrapperTest {
         }
       }
     });
+
+    // Retrieve the LDS resource
     String ldsResource = xdsClient.ldsResource.get(5, TimeUnit.SECONDS);
-    xdsClient.ldsWatcher.onResourceDoesNotExist(ldsResource);
+
+    // Resource does not exist using StatusOr
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("LDS resource does not exist")));
+
+    // Verify listener receives onNotServing with StatusException
     verify(listener, timeout(5000)).onNotServing(any());
+
     try {
       start.get(START_WAIT_AFTER_LISTENER_MILLIS, TimeUnit.MILLISECONDS);
       fail("server should not start()");
     } catch (TimeoutException ex) {
-      // expect to block here.
+      // expect to block here
       assertThat(start.isDone()).isFalse();
     }
+
     verify(listener, times(1)).onNotServing(any(StatusException.class));
     verify(mockBuilder, times(1)).build();
+
+    // Create filter chain and ssl supplier for the next steps
     FilterChain filterChain0 = createFilterChain("filter-chain-0", createRds("rds"));
     SslContextProviderSupplier sslSupplier0 = filterChain0.sslContextProviderSupplier();
+
+    // Deliver LDS update
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain0), null);
-    xdsClient.ldsWatcher.onError(Status.INTERNAL);
+
+    // Simulate error in LDS watcher with StatusOr
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.INTERNAL));
+
     assertThat(selectorManager.getSelectorToUpdateSelector())
         .isSameInstanceAs(FilterChainSelector.NO_FILTER_CHAIN);
+
     ResourceWatcher<RdsUpdate> saveRdsWatcher = xdsClient.rdsWatchers.get("rds");
     verify(mockBuilder, times(1)).build();
     verify(listener, times(2)).onNotServing(any(StatusException.class));
     assertThat(sslSupplier0.isShutdown()).isFalse();
 
+    // Mock server behavior
     when(mockServer.start()).thenThrow(new IOException("error!"))
-            .thenReturn(mockServer);
+        .thenReturn(mockServer);
+
+    // Create filter chain 1 and ssl supplier
     FilterChain filterChain1 = createFilterChain("filter-chain-1", createRds("rds"));
     SslContextProviderSupplier sslSupplier1 = filterChain1.sslContextProviderSupplier();
+
+    // Deliver LDS update for filterChain1
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain1), null);
     assertThat(sslSupplier0.isShutdown()).isTrue();
-    xdsClient.deliverRdsUpdate("rds",
-            Collections.singletonList(createVirtualHost("virtual-host-1")));
+
+    // Deliver RDS update
+    xdsClient.deliverRdsUpdate("rds", Collections.singletonList(createVirtualHost("virtual-host-1")));
+
     try {
       start.get(5000, TimeUnit.MILLISECONDS);
       fail("Start should throw exception");
@@ -785,102 +853,123 @@ public class XdsServerWrapperTest {
       assertThat(ex.getCause()).isInstanceOf(IOException.class);
       assertThat(ex.getCause().getMessage()).isEqualTo("error!");
     }
+
     assertThat(executor.forwardNanos(RETRY_DELAY_NANOS)).isEqualTo(1);
     verify(mockBuilder, times(1)).build();
     verify(mockServer, times(2)).start();
     verify(listener, times(1)).onServing();
+
     assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size())
         .isEqualTo(1);
-    ServerRoutingConfig realConfig =
-        selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(filterChain1).get();
-    assertThat(realConfig.virtualHosts()).isEqualTo(
-        Collections.singletonList(createVirtualHost("virtual-host-1")));
+
+    // Check routing config for filterChain1
+    ServerRoutingConfig realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(filterChain1).get();
+    assertThat(realConfig.virtualHosts()).isEqualTo(Collections.singletonList(createVirtualHost("virtual-host-1")));
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
     // xds update after start
-    xdsClient.deliverRdsUpdate("rds",
-            Collections.singletonList(createVirtualHost("virtual-host-2")));
+    xdsClient.deliverRdsUpdate("rds", Collections.singletonList(createVirtualHost("virtual-host-2")));
     assertThat(sslSupplier1.isShutdown()).isFalse();
-    xdsClient.ldsWatcher.onError(Status.DEADLINE_EXCEEDED);
+
+    // Simulate error with Status.DEADLINE_EXCEEDED
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.DEADLINE_EXCEEDED));
+
     verify(mockBuilder, times(1)).build();
     verify(mockServer, times(2)).start();
     verify(listener, times(2)).onNotServing(any(StatusException.class));
+
     assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size())
         .isEqualTo(1);
-    realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs()
-        .get(filterChain1).get();
-    assertThat(realConfig.virtualHosts()).isEqualTo(
-        Collections.singletonList(createVirtualHost("virtual-host-2")));
+
+    // Verify routing config for filterChain1 after DEADLINE_EXCEEDED error
+    realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(filterChain1).get();
+    assertThat(realConfig.virtualHosts()).isEqualTo(Collections.singletonList(createVirtualHost("virtual-host-2")));
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
     assertThat(sslSupplier1.isShutdown()).isFalse();
 
-    // not serving after serving
-    xdsClient.ldsWatcher.onResourceDoesNotExist(ldsResource);
+    // Simulate resource not found again using StatusOr
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("Resource does not exist")));
+
     assertThat(xdsClient.rdsWatchers).isEmpty();
     verify(mockServer, times(2)).shutdown();
+
     when(mockServer.isShutdown()).thenReturn(true);
     assertThat(selectorManager.getSelectorToUpdateSelector())
         .isSameInstanceAs(FilterChainSelector.NO_FILTER_CHAIN);
+
     verify(listener, times(3)).onNotServing(any(StatusException.class));
     assertThat(sslSupplier1.isShutdown()).isTrue();
-    // no op
-    saveRdsWatcher.onChanged(
-            new RdsUpdate(Collections.singletonList(createVirtualHost("virtual-host-1"))));
+
+    // No-op for RDS watcher
+    saveRdsWatcher.onResourceChanged(StatusOr.fromValue(new RdsUpdate(Collections.singletonList(createVirtualHost("virtual-host-1")))));
     verify(mockBuilder, times(1)).build();
     verify(mockServer, times(2)).start();
     verify(listener, times(1)).onServing();
 
-    // cancel retry
+
+    // Simulate retry cancellation
     when(mockServer.start()).thenThrow(new IOException("error1!"))
-            .thenThrow(new IOException("error2!"))
-            .thenReturn(mockServer);
+        .thenThrow(new IOException("error2!"))
+        .thenReturn(mockServer);
+
+    // Create filterChain2 and ssl supplier
     FilterChain filterChain2 = createFilterChain("filter-chain-2", createRds("rds"));
     SslContextProviderSupplier sslSupplier2 = filterChain2.sslContextProviderSupplier();
+
+    // Deliver updates
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain2), null);
-    xdsClient.deliverRdsUpdate("rds",
-            Collections.singletonList(createVirtualHost("virtual-host-1")));
+    xdsClient.deliverRdsUpdate("rds", Collections.singletonList(createVirtualHost("virtual-host-1")));
+
     assertThat(sslSupplier1.isShutdown()).isTrue();
     verify(mockBuilder, times(2)).build();
+
     when(mockServer.isShutdown()).thenReturn(false);
     verify(mockServer, times(3)).start();
     verify(listener, times(1)).onServing();
     verify(listener, times(3)).onNotServing(any(StatusException.class));
+
     assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size())
         .isEqualTo(1);
-    realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs()
-        .get(filterChain2).get();
-    assertThat(realConfig.virtualHosts()).isEqualTo(
-        Collections.singletonList(createVirtualHost("virtual-host-1")));
+
+    // Check final routing config for filterChain2
+    realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(filterChain2).get();
+    assertThat(realConfig.virtualHosts()).isEqualTo(Collections.singletonList(createVirtualHost("virtual-host-1")));
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
     assertThat(executor.numPendingTasks()).isEqualTo(1);
-    xdsClient.ldsWatcher.onResourceDoesNotExist(ldsResource);
+
+    // Simulate resource does not exist again for cleanup
+    xdsClient.ldsWatcher.onResourceChanged(StatusOr.fromStatus(Status.NOT_FOUND.withDescription("Resource does not exist")));
+
     verify(mockServer, times(3)).shutdown();
     verify(listener, times(4)).onNotServing(any(StatusException.class));
     verify(listener, times(1)).onNotServing(any(IOException.class));
+
     when(mockServer.isShutdown()).thenReturn(true);
     assertThat(executor.numPendingTasks()).isEqualTo(0);
     assertThat(sslSupplier2.isShutdown()).isTrue();
 
-    // serving after not serving
+    // Serving after not serving
     FilterChain filterChain3 = createFilterChain("filter-chain-2", createRds("rds"));
     SslContextProviderSupplier sslSupplier3 = filterChain3.sslContextProviderSupplier();
+
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain3), null);
-    xdsClient.deliverRdsUpdate("rds",
-            Collections.singletonList(createVirtualHost("virtual-host-1")));
+    xdsClient.deliverRdsUpdate("rds", Collections.singletonList(createVirtualHost("virtual-host-1")));
+
     verify(mockBuilder, times(3)).build();
     verify(mockServer, times(4)).start();
     verify(listener, times(1)).onServing();
+
     when(mockServer.isShutdown()).thenReturn(false);
     verify(listener, times(4)).onNotServing(any(StatusException.class));
 
     assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size())
         .isEqualTo(1);
-    realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs()
-        .get(filterChain3).get();
-    assertThat(realConfig.virtualHosts()).isEqualTo(
-        Collections.singletonList(createVirtualHost("virtual-host-1")));
+
+    // Check final routing config for filterChain3
+    realConfig = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().get(filterChain3).get();
+    assertThat(realConfig.virtualHosts()).isEqualTo(Collections.singletonList(createVirtualHost("virtual-host-1")));
     assertThat(realConfig.interceptors()).isEqualTo(ImmutableMap.of());
 
     xdsServerWrapper.shutdown();
@@ -1204,6 +1293,7 @@ public class XdsServerWrapperTest {
     });
     xdsClient.ldsResource.get(5, TimeUnit.SECONDS);
 
+    // Set up mock filter and filter provider
     Filter filter = mock(Filter.class);
     Filter.Provider filterProvider = mock(Filter.Provider.class);
     when(filterProvider.typeUrls()).thenReturn(new String[]{"filter-type-url"});
@@ -1211,6 +1301,7 @@ public class XdsServerWrapperTest {
     when(filterProvider.newInstance(any(String.class))).thenReturn(filter);
     filterRegistry.register(filterProvider);
 
+    // Mock FilterConfig and interceptors
     FilterConfig f0 = mock(FilterConfig.class);
     FilterConfig f0Override = mock(FilterConfig.class);
     when(f0.typeUrl()).thenReturn("filter-type-url");
@@ -1233,16 +1324,19 @@ public class XdsServerWrapperTest {
     };
     when(filter.buildServerInterceptor(f0, null)).thenReturn(interceptor0);
     when(filter.buildServerInterceptor(f0, f0Override)).thenReturn(interceptor1);
+
+    // Create RouteMatch and HttpConnectionManager
     RouteMatch routeMatch =
         RouteMatch.create(
             PathMatcher.fromPath("/FooService/barMethod", true),
             Collections.<HeaderMatcher>emptyList(), null);
-
     HttpConnectionManager rdsHcm = HttpConnectionManager.forRdsName(0L, "r0",
         Arrays.asList(new NamedFilterConfig("filter-config-name-0", f0),
             new NamedFilterConfig("filter-config-name-1", f0)));
     EnvoyServerProtoData.FilterChain filterChain = createFilterChain("filter-chain-0", rdsHcm);
     xdsClient.deliverLdsUpdate(Collections.singletonList(filterChain), null);
+
+    // Create Route and VirtualHost
     Route route = Route.forAction(routeMatch, null,
         ImmutableMap.<String, FilterConfig>of());
     VirtualHost virtualHost  = VirtualHost.create(
@@ -1254,6 +1348,8 @@ public class XdsServerWrapperTest {
     verify(mockServer).start();
     assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs().size())
         .isEqualTo(1);
+
+    // Get the real interceptor and test it
     ServerInterceptor realInterceptor = selectorManager.getSelectorToUpdateSelector()
         .getRoutingConfigs().get(filterChain).get().interceptors().get(route);
     assertThat(realInterceptor).isNotNull();
@@ -1266,9 +1362,10 @@ public class XdsServerWrapperTest {
     assertThat(interceptorTrace).isEqualTo(Arrays.asList(1, 0));
     verify(mockNext).startCall(eq(serverCall), any(Metadata.class));
 
+    // Update VirtualHost without overriding filter config
     virtualHost  = VirtualHost.create(
         "v1", Collections.singletonList("foo.google.com"), Arrays.asList(route),
-         ImmutableMap.<String, FilterConfig>of());
+        ImmutableMap.<String, FilterConfig>of());
     xdsClient.deliverRdsUpdate("r0", Collections.singletonList(virtualHost));
     realInterceptor = selectorManager.getSelectorToUpdateSelector().getRoutingConfigs()
         .get(filterChain).get().interceptors().get(route);
@@ -1278,7 +1375,10 @@ public class XdsServerWrapperTest {
     assertThat(interceptorTrace).isEqualTo(Arrays.asList(0, 0));
     verify(mockNext, times(2)).startCall(eq(serverCall), any(Metadata.class));
 
-    xdsClient.rdsWatchers.get("r0").onResourceDoesNotExist("r0");
+    // Replace onResourceDoesNotExist with onResourceChanged
+    xdsClient.rdsWatchers.get("r0").onResourceChanged(StatusOr.fromValue(null));
+
+    // Assert no routing config is present
     assertThat(selectorManager.getSelectorToUpdateSelector().getRoutingConfigs()
         .get(filterChain).get()).isEqualTo(noopConfig);
   }
