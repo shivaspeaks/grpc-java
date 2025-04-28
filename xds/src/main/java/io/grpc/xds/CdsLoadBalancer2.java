@@ -26,6 +26,7 @@ import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancerRegistry;
 import io.grpc.NameResolver;
 import io.grpc.Status;
+import io.grpc.StatusOr;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.ObjectPool;
 import io.grpc.util.GracefulSwitchLoadBalancer;
@@ -334,55 +335,45 @@ final class CdsLoadBalancer2 extends LoadBalancer {
       }
 
       @Override
-      public void onError(Status error) {
-        Status status = Status.UNAVAILABLE
-            .withDescription(
-                String.format("Unable to load CDS %s. xDS server returned: %s: %s",
-                  name, error.getCode(), error.getDescription()))
-            .withCause(error.getCause());
+      public void onResourceChanged(StatusOr<CdsUpdate> update) {
         if (shutdown) {
           return;
         }
-        // All watchers should receive the same error, so we only propagate it once.
-        if (ClusterState.this == root) {
-          handleClusterDiscoveryError(status);
-        }
-      }
 
-      @Override
-      public void onResourceDoesNotExist(String resourceName) {
-        if (shutdown) {
-          return;
-        }
         discovered = true;
-        result = null;
-        if (childClusterStates != null) {
-          for (ClusterState state : childClusterStates.values()) {
-            state.shutdown();
+        if (!update.hasValue()) {
+          Status error = Status.UNAVAILABLE
+              .withDescription(String.format("Unable to load CDS %s. xDS server returned: %s: %s",
+                  name, update.getStatus().getCode(), update.getStatus().getDescription()))
+              .withCause(update.getStatus().getCause());
+          if (ClusterState.this == root) {
+            handleClusterDiscoveryError(error);
           }
-          childClusterStates = null;
-        }
-        handleClusterDiscovered();
-      }
-
-      @Override
-      public void onChanged(final CdsUpdate update) {
-        if (shutdown) {
+          result = null;
+          if (childClusterStates != null) {
+            for (ClusterState state : childClusterStates.values()) {
+              state.shutdown();
+            }
+            childClusterStates = null;
+          }
+          handleClusterDiscovered();
           return;
         }
-        logger.log(XdsLogLevel.DEBUG, "Received cluster update {0}", update);
-        discovered = true;
-        result = update;
-        if (update.clusterType() == ClusterType.AGGREGATE) {
+
+        CdsUpdate cdsUpdate = update.getValue();
+        logger.log(XdsLogLevel.DEBUG, "Received cluster update {0}", cdsUpdate);
+        result = cdsUpdate;
+
+        if (cdsUpdate.clusterType() == ClusterType.AGGREGATE) {
           isLeaf = false;
           logger.log(XdsLogLevel.INFO, "Aggregate cluster {0}, underlying clusters: {1}",
-              update.clusterName(), update.prioritizedClusterNames());
+              cdsUpdate.clusterName(), cdsUpdate.prioritizedClusterNames());
           Map<String, ClusterState> newChildStates = new LinkedHashMap<>();
-          for (String cluster : update.prioritizedClusterNames()) {
+          for (String cluster : cdsUpdate.prioritizedClusterNames()) {
             if (newChildStates.containsKey(cluster)) {
               logger.log(XdsLogLevel.WARNING,
                   String.format("duplicate cluster name %s in aggregate %s is being ignored",
-                      cluster, update.clusterName()));
+                      cluster, cdsUpdate.clusterName()));
               continue;
             }
             if (childClusterStates == null || !childClusterStates.containsKey(cluster)) {
@@ -408,17 +399,31 @@ final class CdsLoadBalancer2 extends LoadBalancer {
             }
           }
           childClusterStates = newChildStates;
-        } else if (update.clusterType() == ClusterType.EDS) {
+        } else if (cdsUpdate.clusterType() == ClusterType.EDS) {
           isLeaf = true;
           logger.log(XdsLogLevel.INFO, "EDS cluster {0}, edsServiceName: {1}",
-              update.clusterName(), update.edsServiceName());
+              cdsUpdate.clusterName(), cdsUpdate.edsServiceName());
         } else {  // logical DNS
           isLeaf = true;
-          logger.log(XdsLogLevel.INFO, "Logical DNS cluster {0}", update.clusterName());
+          logger.log(XdsLogLevel.INFO, "Logical DNS cluster {0}", cdsUpdate.clusterName());
         }
         handleClusterDiscovered();
       }
 
+      @Override
+      public void onAmbientError(Status error) {
+        if (shutdown) {
+          return;
+        }
+        Status status = Status.UNAVAILABLE
+            .withDescription(String.format("Unable to load CDS %s. xDS server returned: %s: %s",
+                name, error.getCode(), error.getDescription()))
+            .withCause(error.getCause());
+        // All watchers should receive the same error, so we only propagate it once.
+        if (ClusterState.this == root) {
+          handleClusterDiscoveryError(status);
+        }
+      }
     }
   }
 }

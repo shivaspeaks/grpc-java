@@ -46,6 +46,7 @@ import io.grpc.LoadBalancerRegistry;
 import io.grpc.NameResolver;
 import io.grpc.Status;
 import io.grpc.Status.Code;
+import io.grpc.StatusOr;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.ObjectPool;
 import io.grpc.util.GracefulSwitchLoadBalancerAccessor;
@@ -854,21 +855,22 @@ public class CdsLoadBalancer2Test {
       if (watchers.containsKey(clusterName)) {
         List<ResourceWatcher<CdsUpdate>> resourceWatchers =
             ImmutableList.copyOf(watchers.get(clusterName));
-        resourceWatchers.forEach(w -> w.onChanged(update));
+        resourceWatchers.forEach(w -> w.onResourceChanged(StatusOr.fromValue(update)));
       }
     }
 
-    private void deliverResourceNotExist(String clusterName)  {
+    private void deliverResourceNotExist(String clusterName) {
       if (watchers.containsKey(clusterName)) {
         ImmutableList.copyOf(watchers.get(clusterName))
-            .forEach(w -> w.onResourceDoesNotExist(clusterName));
+            .forEach(w -> w.onResourceChanged(StatusOr.fromStatus(
+                Status.NOT_FOUND.withDescription("Resource " + clusterName + " does not exist"))));
       }
     }
 
     private void deliverError(Status error) {
       watchers.values().stream()
           .flatMap(List::stream)
-          .forEach(w -> w.onError(error));
+          .forEach(w -> w.onResourceChanged(StatusOr.fromStatus(error)));
     }
   }
 }
