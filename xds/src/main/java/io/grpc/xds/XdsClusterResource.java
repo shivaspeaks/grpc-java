@@ -69,6 +69,10 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
       GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_HTTP_CONNECT", false);
 
   @VisibleForTesting
+  static boolean isEnabledOrcaLrsPropagation =
+      GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_ORCA_LRS_PROPAGATION", false);
+
+  @VisibleForTesting
   static final String AGGREGATE_CLUSTER_TYPE_NAME = "envoy.clusters.aggregate";
   static final String ADS_TYPE_URL_CDS =
       "type.googleapis.com/envoy.config.cluster.v3.Cluster";
@@ -227,12 +231,22 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
     UpstreamTlsContext upstreamTlsContext = null;
     OutlierDetection outlierDetection = null;
     boolean isHttp11ProxyAvailable = false;
+    BackendMetricPropagation backendMetricPropagation = null;
+    
     if (cluster.hasLrsServer()) {
       if (!cluster.getLrsServer().hasSelf()) {
         return StructOrError.fromError(
             "Cluster " + clusterName + ": only support LRS for the same management server");
       }
       lrsServerInfo = serverInfo;
+    }
+    
+    // Parse backend metric propagation configuration if enabled and LRS is configured
+    if (isEnabledOrcaLrsPropagation && lrsServerInfo != null) {
+      java.util.List<String> lrsReportEndpointMetrics = null;
+      // Access protobuf field for metric propagation configuration
+      lrsReportEndpointMetrics = cluster.getLrsReportEndpointMetricsList();
+      backendMetricPropagation = BackendMetricPropagation.fromMetricSpecs(lrsReportEndpointMetrics);
     }
     if (cluster.hasCircuitBreakers()) {
       List<Thresholds> thresholds = cluster.getCircuitBreakers().getThresholdsList();
@@ -326,7 +340,7 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
 
       return StructOrError.fromStruct(CdsUpdate.forEds(
           clusterName, edsServiceName, lrsServerInfo, maxConcurrentRequests, upstreamTlsContext,
-          outlierDetection, isHttp11ProxyAvailable));
+          outlierDetection, isHttp11ProxyAvailable, backendMetricPropagation));
     } else if (type.equals(Cluster.DiscoveryType.LOGICAL_DNS)) {
       if (!cluster.hasLoadAssignment()) {
         return StructOrError.fromError(
@@ -362,7 +376,7 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
           Locale.US, "%s:%d", socketAddress.getAddress(), socketAddress.getPortValue());
       return StructOrError.fromStruct(CdsUpdate.forLogicalDns(
           clusterName, dnsHostName, lrsServerInfo, maxConcurrentRequests,
-          upstreamTlsContext, isHttp11ProxyAvailable));
+          upstreamTlsContext, isHttp11ProxyAvailable, backendMetricPropagation));
     }
     return StructOrError.fromError(
         "Cluster " + clusterName + ": unsupported built-in discovery type: " + type);
@@ -614,6 +628,11 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
 
     abstract ImmutableMap<String, Object> parsedMetadata();
 
+    // Backend metric propagation configuration for LRS reporting.
+    // Only valid for EDS or LOGICAL_DNS cluster with LRS enabled.
+    @Nullable
+    abstract BackendMetricPropagation backendMetricPropagation();
+
     private static Builder newBuilder(String clusterName) {
       return new AutoValue_XdsClusterResource_CdsUpdate.Builder()
           .clusterName(clusterName)
@@ -636,7 +655,8 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
                           @Nullable ServerInfo lrsServerInfo, @Nullable Long maxConcurrentRequests,
                           @Nullable UpstreamTlsContext upstreamTlsContext,
                           @Nullable OutlierDetection outlierDetection,
-                          boolean isHttp11ProxyAvailable) {
+                          boolean isHttp11ProxyAvailable,
+                          @Nullable BackendMetricPropagation backendMetricPropagation) {
       return newBuilder(clusterName)
           .clusterType(ClusterType.EDS)
           .edsServiceName(edsServiceName)
@@ -644,21 +664,24 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
           .maxConcurrentRequests(maxConcurrentRequests)
           .upstreamTlsContext(upstreamTlsContext)
           .outlierDetection(outlierDetection)
-          .isHttp11ProxyAvailable(isHttp11ProxyAvailable);
+          .isHttp11ProxyAvailable(isHttp11ProxyAvailable)
+          .backendMetricPropagation(backendMetricPropagation);
     }
 
     static Builder forLogicalDns(String clusterName, String dnsHostName,
                                  @Nullable ServerInfo lrsServerInfo,
                                  @Nullable Long maxConcurrentRequests,
                                  @Nullable UpstreamTlsContext upstreamTlsContext,
-                                 boolean isHttp11ProxyAvailable) {
+                                 boolean isHttp11ProxyAvailable,
+                                 @Nullable BackendMetricPropagation backendMetricPropagation) {
       return newBuilder(clusterName)
           .clusterType(ClusterType.LOGICAL_DNS)
           .dnsHostName(dnsHostName)
           .lrsServerInfo(lrsServerInfo)
           .maxConcurrentRequests(maxConcurrentRequests)
           .upstreamTlsContext(upstreamTlsContext)
-          .isHttp11ProxyAvailable(isHttp11ProxyAvailable);
+          .isHttp11ProxyAvailable(isHttp11ProxyAvailable)
+          .backendMetricPropagation(backendMetricPropagation);
     }
 
     enum ClusterType {
@@ -748,6 +771,8 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
       protected abstract Builder filterMetadata(ImmutableMap<String, Struct> filterMetadata);
 
       protected abstract Builder parsedMetadata(ImmutableMap<String, Object> parsedMetadata);
+
+      protected abstract Builder backendMetricPropagation(BackendMetricPropagation backendMetricPropagation);
 
       abstract CdsUpdate build();
     }

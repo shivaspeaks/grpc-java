@@ -105,6 +105,19 @@ public final class LoadStatsManager2 {
   @VisibleForTesting
   public synchronized ClusterLocalityStats getClusterLocalityStats(
       String cluster, @Nullable String edsServiceName, Locality locality) {
+    return getClusterLocalityStats(cluster, edsServiceName, locality, null);
+  }
+
+  /**
+   * Gets or creates the stats object for recording loads for the specified locality (in the
+   * specified cluster with edsServiceName) with the specified backend metric propagation
+   * configuration. The returned object is reference counted and the caller should use 
+   * {@link ClusterLocalityStats#release} to release its <i>hard</i> reference when it is safe 
+   * to discard the future stats for the locality.
+   */
+  public synchronized ClusterLocalityStats getClusterLocalityStats(
+      String cluster, @Nullable String edsServiceName, Locality locality,
+      @Nullable io.grpc.xds.BackendMetricPropagation backendMetricPropagation) {
     if (!allLoadStats.containsKey(cluster)) {
       allLoadStats.put(
           cluster,
@@ -122,7 +135,7 @@ public final class LoadStatsManager2 {
       localityStats.put(
           locality,
           ReferenceCounted.wrap(new ClusterLocalityStats(
-              cluster, edsServiceName, locality, stopwatchSupplier.get())));
+              cluster, edsServiceName, locality, stopwatchSupplier.get(), backendMetricPropagation)));
     }
     ReferenceCounted<ClusterLocalityStats> ref = localityStats.get(locality);
     ref.retain();
@@ -325,6 +338,8 @@ public final class LoadStatsManager2 {
     private final String edsServiceName;
     private final Locality locality;
     private final Stopwatch stopwatch;
+    @Nullable
+    private final io.grpc.xds.BackendMetricPropagation backendMetricPropagation;
     private final AtomicLong callsInProgress = new AtomicLong();
     private final AtomicLong callsSucceeded = new AtomicLong();
     private final AtomicLong callsFailed = new AtomicLong();
@@ -333,11 +348,12 @@ public final class LoadStatsManager2 {
 
     private ClusterLocalityStats(
         String clusterName, @Nullable String edsServiceName, Locality locality,
-        Stopwatch stopwatch) {
+        Stopwatch stopwatch, @Nullable io.grpc.xds.BackendMetricPropagation backendMetricPropagation) {
       this.clusterName = checkNotNull(clusterName, "clusterName");
       this.edsServiceName = edsServiceName;
       this.locality = checkNotNull(locality, "locality");
       this.stopwatch = checkNotNull(stopwatch, "stopwatch");
+      this.backendMetricPropagation = backendMetricPropagation;
       stopwatch.reset().start();
     }
 
@@ -367,13 +383,34 @@ public final class LoadStatsManager2 {
      * requests counter of 1 and the {@code value} if the key is not present in the map. Otherwise,
      * increments the finished requests counter and adds the {@code value} to the existing
      * {@link BackendLoadMetricStats}.
+     * 
+     * Metrics are filtered based on the backend metric propagation configuration if configured.
      */
     public synchronized void recordBackendLoadMetricStats(Map<String, Double> namedMetrics) {
+      if (namedMetrics == null || namedMetrics.isEmpty()) {
+        return;
+      }
+      
+      // If no propagation configuration is set, use the old behavior (propagate everything)
+      // Otherwise, filter based on the configuration
       namedMetrics.forEach((name, value) -> {
-        if (!loadMetricStatsMap.containsKey(name)) {
-          loadMetricStatsMap.put(name, new BackendLoadMetricStats(1, value));
-        } else {
-          loadMetricStatsMap.get(name).addMetricValueAndIncrementRequestsFinished(value);
+        boolean shouldPropagate = true;
+        if (backendMetricPropagation != null) {
+          shouldPropagate = backendMetricPropagation.shouldPropagateNamedMetric(name);
+        }
+        
+        if (shouldPropagate) {
+          // Prefix named metrics as per gRFC A85
+          String prefixedName = name;
+          if (backendMetricPropagation != null) {
+            prefixedName = "named_metrics." + name;
+          }
+          
+          if (!loadMetricStatsMap.containsKey(prefixedName)) {
+            loadMetricStatsMap.put(prefixedName, new BackendLoadMetricStats(1, value));
+          } else {
+            loadMetricStatsMap.get(prefixedName).addMetricValueAndIncrementRequestsFinished(value);
+          }
         }
       });
     }

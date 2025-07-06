@@ -148,6 +148,7 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
     childLbHelper.updateMaxConcurrentRequests(config.maxConcurrentRequests);
     childLbHelper.updateSslContextProviderSupplier(config.tlsContext);
     childLbHelper.updateFilterMetadata(config.filterMetadata);
+    childLbHelper.updateBackendMetricPropagation(config.backendMetricPropagation);
 
     childSwitchLb.handleResolvedAddresses(
         resolvedAddresses.toBuilder()
@@ -208,6 +209,8 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
     private Map<String, Struct> filterMetadata = ImmutableMap.of();
     @Nullable
     private final ServerInfo lrsServerInfo;
+    @Nullable
+    private BackendMetricPropagation backendMetricPropagation;
 
     private ClusterImplLbHelper(AtomicLong inFlights, @Nullable ServerInfo lrsServerInfo) {
       this.inFlights = checkNotNull(inFlights, "inFlights");
@@ -320,7 +323,7 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
           (lrsServerInfo == null)
               ? null
               : xdsClient.addClusterLocalityStats(lrsServerInfo, cluster,
-                  edsServiceName, locality);
+                  edsServiceName, locality, backendMetricPropagation);
 
       return new ClusterLocality(localityStats, localityName);
     }
@@ -368,6 +371,11 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
 
     private void updateFilterMetadata(Map<String, Struct> filterMetadata) {
       this.filterMetadata = ImmutableMap.copyOf(filterMetadata);
+    }
+
+    private void updateBackendMetricPropagation(
+        @Nullable BackendMetricPropagation backendMetricPropagation) {
+      this.backendMetricPropagation = backendMetricPropagation;
     }
 
     private class RequestLimitingSubchannelPicker extends SubchannelPicker {
