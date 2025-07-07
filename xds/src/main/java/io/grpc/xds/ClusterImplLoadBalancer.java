@@ -513,11 +513,20 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
     }
 
     /**
-     * Copies {@link MetricReport#getNamedMetrics()} to {@link ClusterLocalityStats} such that it is
-     * included in the snapshot for the LRS report sent to the LRS server.
+     * Copies ORCA metrics from {@link MetricReport} to {@link ClusterLocalityStats} such that they are
+     * included in the snapshot for the LRS report sent to the LRS server. This includes both
+     * top-level metrics (CPU, memory, application utilization) and named metrics, filtered
+     * according to the backend metric propagation configuration.
      */
     @Override
     public void onLoadReport(MetricReport report) {
+      // Record top-level metrics (CPU, memory, application utilization)
+      stats.recordTopLevelMetrics(
+          report.getCpuUtilization(),
+          report.getMemoryUtilization(), 
+          report.getApplicationUtilization());
+      
+      // Record named metrics
       stats.recordBackendLoadMetricStats(report.getNamedMetrics());
     }
   }

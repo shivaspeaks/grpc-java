@@ -416,6 +416,69 @@ public final class LoadStatsManager2 {
     }
 
     /**
+     * Records top-level ORCA metrics (CPU, memory, application utilization) for per-call load 
+     * reporting. Metrics are filtered based on the backend metric propagation configuration 
+     * if configured.
+     * 
+     * @param cpuUtilization CPU utilization metric value
+     * @param memUtilization Memory utilization metric value  
+     * @param applicationUtilization Application utilization metric value
+     */
+    public synchronized void recordTopLevelMetrics(double cpuUtilization, double memUtilization, 
+                                                   double applicationUtilization) {
+      // If no propagation configuration is set, use the old behavior (propagate everything)
+      // Otherwise, filter based on the configuration
+      
+      if (cpuUtilization > 0) {
+        boolean shouldPropagate = true;
+        if (backendMetricPropagation != null) {
+          shouldPropagate = backendMetricPropagation.propagateCpuUtilization();
+        }
+        
+        if (shouldPropagate) {
+          String metricName = "cpu_utilization";
+          if (!loadMetricStatsMap.containsKey(metricName)) {
+            loadMetricStatsMap.put(metricName, new BackendLoadMetricStats(1, cpuUtilization));
+          } else {
+            loadMetricStatsMap.get(metricName).addMetricValueAndIncrementRequestsFinished(cpuUtilization);
+          }
+        }
+      }
+      
+      if (memUtilization > 0) {
+        boolean shouldPropagate = true;
+        if (backendMetricPropagation != null) {
+          shouldPropagate = backendMetricPropagation.propagateMemUtilization();
+        }
+        
+        if (shouldPropagate) {
+          String metricName = "mem_utilization";
+          if (!loadMetricStatsMap.containsKey(metricName)) {
+            loadMetricStatsMap.put(metricName, new BackendLoadMetricStats(1, memUtilization));
+          } else {
+            loadMetricStatsMap.get(metricName).addMetricValueAndIncrementRequestsFinished(memUtilization);
+          }
+        }
+      }
+      
+      if (applicationUtilization > 0) {
+        boolean shouldPropagate = true;
+        if (backendMetricPropagation != null) {
+          shouldPropagate = backendMetricPropagation.propagateApplicationUtilization();
+        }
+        
+        if (shouldPropagate) {
+          String metricName = "application_utilization";
+          if (!loadMetricStatsMap.containsKey(metricName)) {
+            loadMetricStatsMap.put(metricName, new BackendLoadMetricStats(1, applicationUtilization));
+          } else {
+            loadMetricStatsMap.get(metricName).addMetricValueAndIncrementRequestsFinished(applicationUtilization);
+          }
+        }
+      }
+    }
+
+    /**
      * Release the <i>hard</i> reference for this stats object (previously obtained via {@link
      * LoadStatsManager2#getClusterLocalityStats}). The object may still be
      * recording loads after this method, but there is no guarantee loads recorded after this

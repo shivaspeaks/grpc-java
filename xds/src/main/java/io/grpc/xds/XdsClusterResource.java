@@ -243,10 +243,9 @@ class XdsClusterResource extends XdsResourceType<CdsUpdate> {
     
     // Parse backend metric propagation configuration if enabled and LRS is configured
     if (isEnabledOrcaLrsPropagation && lrsServerInfo != null) {
-      java.util.List<String> lrsReportEndpointMetrics = null;
       // Access protobuf field for metric propagation configuration
-      lrsReportEndpointMetrics = cluster.getLrsReportEndpointMetricsList();
-      backendMetricPropagation = BackendMetricPropagation.fromMetricSpecs(lrsReportEndpointMetrics);
+      backendMetricPropagation = BackendMetricPropagation.fromMetricSpecs(
+          cluster.getLrsReportEndpointMetricsList());
     }
     if (cluster.hasCircuitBreakers()) {
       List<Thresholds> thresholds = cluster.getCircuitBreakers().getThresholdsList();
