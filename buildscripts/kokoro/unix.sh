@@ -35,12 +35,40 @@ org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=1024m
 EOF
 
 ARCH="$ARCH" buildscripts/make_dependencies.sh
+## For universal binaries on macOS, instruct clang to build for both architectures.
+#if [[ "$(uname -s)" == "Darwin" ]]; then
+#  export CFLAGS="-arch arm64 -arch x86_64"
+#  export CXXFLAGS="-arch arm64 -arch x86_64"
+#  export LDFLAGS="-arch arm64 -arch x86_64"
+#fi
+#
+## Set properties via flags, do not pollute gradle.properties
+#GRADLE_FLAGS="${GRADLE_FLAGS:-}"
+#if [[ "$(uname -s)" == "Darwin" ]]; then
+#  echo "Skipping -PtargetArch for macOS universal build"
+#else
+#  GRADLE_FLAGS+=" -PtargetArch=$ARCH"
+#fi
 
-# Set properties via flags, do not pollute gradle.properties
-GRADLE_FLAGS="${GRADLE_FLAGS:-}"
-GRADLE_FLAGS+=" -PtargetArch=$ARCH"
+ # Set properties via flags, do not pollute gradle.properties
+ GRADLE_FLAGS="${GRADLE_FLAGS:-}"
+
+# Configure OS-specific build flags.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # For universal binaries on macOS, instruct clang to build for both architectures.
+  export CFLAGS="-arch arm64 -arch x86_64"
+  export CXXFLAGS="-arch arm64 -arch x86_64"
+  export LDFLAGS="-arch arm64 -arch x86_64"
+  # The universal protoc generates code with deprecation warnings, so we disable this check for macOS.
+  GRADLE_FLAGS+=" -PfailOnWarnings=false"
+else
+  # For Linux, build for a single, specific architecture.
+  GRADLE_FLAGS+=" -PtargetArch=$ARCH"
+  GRADLE_FLAGS+=" -PfailOnWarnings=true"
+fi
+
+GRADLE_FLAGS+=" -Pprotoc=/tmp/protobuf/bin/protoc"
 GRADLE_FLAGS+=" -Pcheckstyle.ignoreFailures=false"
-GRADLE_FLAGS+=" -PfailOnWarnings=true"
 GRADLE_FLAGS+=" -PerrorProne=true"
 GRADLE_FLAGS+=" -Dorg.gradle.parallel=true"
 if [[ -z "${ALL_ARTIFACTS:-}" ]]; then
@@ -51,8 +79,8 @@ fi
 export GRADLE_OPTS="-Dorg.gradle.jvmargs='-Xmx1g'"
 
 # Make protobuf discoverable by :grpc-compiler
-export LDFLAGS="$(PKG_CONFIG_PATH=/tmp/protobuf/lib/pkgconfig pkg-config --libs protobuf)"
-export CXXFLAGS="$(PKG_CONFIG_PATH=/tmp/protobuf/lib/pkgconfig pkg-config --cflags protobuf)"
+export LDFLAGS="$LDFLAGS $(PKG_CONFIG_PATH=/tmp/protobuf/lib/pkgconfig pkg-config --libs protobuf)"
+export CXXFLAGS="$CXXFLAGS $(PKG_CONFIG_PATH=/tmp/protobuf/lib/pkgconfig pkg-config --cflags protobuf)"
 export LIBRARY_PATH=/tmp/protobuf/lib
 
 ./gradlew grpc-compiler:clean $GRADLE_FLAGS
