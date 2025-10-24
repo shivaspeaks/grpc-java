@@ -60,12 +60,15 @@ public class GrpcBootstrapperImplTest {
   private String originalBootstrapConfigFromEnvVar;
   private String originalBootstrapConfigFromSysProp;
   private boolean originalExperimentalXdsFallbackFlag;
+  private String originalXdsDataErrorHandling;
 
   @Before
   public void setUp() {
     saveEnvironment();
     originalExperimentalXdsFallbackFlag = CommonBootstrapperTestUtils.setEnableXdsFallback(true);
     bootstrapper.bootstrapPathFromEnvVar = BOOTSTRAP_FILE_PATH;
+    originalXdsDataErrorHandling = System.getProperty("GRPC_EXPERIMENTAL_XDS_DATA_ERROR_HANDLING");
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_DATA_ERROR_HANDLING", "false");
   }
 
   private void saveEnvironment() {
@@ -77,6 +80,11 @@ public class GrpcBootstrapperImplTest {
 
   @After
   public void restoreEnvironment() {
+    if (originalXdsDataErrorHandling != null) {
+      System.setProperty("GRPC_EXPERIMENTAL_XDS_DATA_ERROR_HANDLING", originalXdsDataErrorHandling);
+    } else {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_DATA_ERROR_HANDLING");
+    }
     bootstrapper.bootstrapPathFromEnvVar = originalBootstrapPathFromEnvVar;
     bootstrapper.bootstrapPathFromSysProp = originalBootstrapPathFromSysProp;
     bootstrapper.bootstrapConfigFromEnvVar = originalBootstrapConfigFromEnvVar;
@@ -606,6 +614,7 @@ public class GrpcBootstrapperImplTest {
     ServerInfo serverInfo = Iterables.getOnlyElement(info.servers());
     assertThat(serverInfo.target()).isEqualTo(SERVER_URI);
     assertThat(serverInfo.implSpecificConfig()).isInstanceOf(InsecureChannelCredentials.class);
+    // okshiva: the changes introduced flakyness for the below assert
     assertThat(serverInfo.ignoreResourceDeletion()).isFalse();
   }
 
