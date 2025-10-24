@@ -615,7 +615,7 @@ public class GrpcBootstrapperImplTest {
     assertThat(serverInfo.target()).isEqualTo(SERVER_URI);
     assertThat(serverInfo.implSpecificConfig()).isInstanceOf(InsecureChannelCredentials.class);
     // okshiva: the changes introduced flakyness for the below assert
-    // assertThat(serverInfo.ignoreResourceDeletion()).isFalse();
+    assertThat(serverInfo.ignoreResourceDeletion()).isFalse();
   }
 
   @Test
