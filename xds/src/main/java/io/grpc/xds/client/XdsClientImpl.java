@@ -607,9 +607,13 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
         subscriber.onRejected(args.versionInfo, updateTime, errorDetail);
         
         // Handle data errors (NACKs) based on fail_on_data_errors server feature.
-        // When fail_on_data_errors is present and we have cached data, delete it so that
-        // onError will call onResourceChanged instead of onAmbientError.
-        if (subscriber.data != null && args.serverInfo.failOnDataErrors()) {
+        // When xdsDataErrorHandlingEnabled is true and fail_on_data_errors is present,
+        // delete cached data so onError will call onResourceChanged instead of onAmbientError.
+        // When xdsDataErrorHandlingEnabled is false, use old behavior (always keep cached data).
+        boolean xdsDataErrorHandlingEnabled = 
+            io.grpc.xds.client.BootstrapperImpl.xdsDataErrorHandlingEnabled;
+        if (xdsDataErrorHandlingEnabled && subscriber.data != null 
+            && args.serverInfo.failOnDataErrors()) {
           subscriber.data = null;
         }
         // Call onError, which will decide whether to call onResourceChanged or onAmbientError
@@ -869,21 +873,42 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
       }
 
       // Handle data errors (resource deletions) based on fail_on_data_errors server feature.
-      // When fail_on_data_errors is not present, we treat deletions as ambient errors and keep
-      // using the cached resource. When it is present, we delete the cached resource and fail.
+      // When xdsDataErrorHandlingEnabled is true and fail_on_data_errors is not present,
+      // we treat deletions as ambient errors and keep using the cached resource.
+      // When fail_on_data_errors is present, we delete the cached resource and fail.
+      // When xdsDataErrorHandlingEnabled is false, use the old behavior (ignore_resource_deletion).
       boolean ignoreResourceDeletionEnabled = serverInfo.ignoreResourceDeletion();
       boolean failOnDataErrors = serverInfo.failOnDataErrors();
-      if (type.isFullStateOfTheWorld() && data != null && !failOnDataErrors) {
-        if (ignoreResourceDeletionEnabled && !resourceDeletionIgnored) {
-          logger.log(XdsLogLevel.FORCE_WARNING,
-              "xds server {0}: ignoring deletion for resource type {1} name {2}}",
-              serverInfo.target(), type, resource);
-          resourceDeletionIgnored = true;
+      boolean xdsDataErrorHandlingEnabled = 
+          io.grpc.xds.client.BootstrapperImpl.xdsDataErrorHandlingEnabled;
+      
+      if (type.isFullStateOfTheWorld() && data != null) {
+        // New behavior (gRFC A88): Default is to treat deletions as ambient errors
+        if (xdsDataErrorHandlingEnabled && !failOnDataErrors) {
+          if (!resourceDeletionIgnored) {
+            logger.log(XdsLogLevel.FORCE_WARNING,
+                "xds server {0}: ignoring deletion for resource type {1} name {2}}",
+                serverInfo.target(), type, resource);
+            resourceDeletionIgnored = true;
+          }
+          Status deletionStatus = Status.NOT_FOUND.withDescription(
+              "Resource " + resource + " deleted from server");
+          onAmbientError(deletionStatus, processingTracker);
+          return;
         }
-        Status deletionStatus = Status.NOT_FOUND.withDescription(
-            "Resource " + resource + " deleted from server");
-        onAmbientError(deletionStatus, processingTracker);
-        return;
+        // Old behavior: Use ignore_resource_deletion server feature
+        if (!xdsDataErrorHandlingEnabled && ignoreResourceDeletionEnabled) {
+          if (!resourceDeletionIgnored) {
+            logger.log(XdsLogLevel.FORCE_WARNING,
+                "xds server {0}: ignoring deletion for resource type {1} name {2}}",
+                serverInfo.target(), type, resource);
+            resourceDeletionIgnored = true;
+          }
+          Status deletionStatus = Status.NOT_FOUND.withDescription(
+              "Resource " + resource + " deleted from server");
+          onAmbientError(deletionStatus, processingTracker);
+          return;
+        }
       }
 
       logger.log(XdsLogLevel.INFO, "Conclude {0} resource {1} not exist", type, resource);
