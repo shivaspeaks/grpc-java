@@ -603,16 +603,18 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
       }
 
       if (invalidResources.contains(resourceName)) {
-        // The resource update is invalid. Capture the error without notifying the watchers.
+        // The resource update is invalid (NACK). Handle as a data error.
         subscriber.onRejected(args.versionInfo, updateTime, errorDetail);
-      }
-
-      if (invalidResources.contains(resourceName)) {
-        // The resource is missing. Reuse the cached resource if possible.
-        if (subscriber.data == null) {
-          // No cached data. Notify the watchers of an invalid update.
-          subscriber.onError(Status.UNAVAILABLE.withDescription(errorDetail), processingTracker);
+        
+        // Handle data errors (NACKs) based on fail_on_data_errors server feature.
+        // When fail_on_data_errors is present and we have cached data, delete it so that
+        // onError will call onResourceChanged instead of onAmbientError.
+        if (subscriber.data != null && args.serverInfo.failOnDataErrors()) {
+          subscriber.data = null;
         }
+        // Call onError, which will decide whether to call onResourceChanged or onAmbientError
+        // based on whether data exists after the above deletion.
+        subscriber.onError(Status.UNAVAILABLE.withDescription(errorDetail), processingTracker);
         continue;
       }
 
@@ -866,11 +868,13 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
         return;
       }
 
-      // Ignore deletion of State of the World resources when this feature is on,
-      // and the resource is reusable.
+      // Handle data errors (resource deletions) based on fail_on_data_errors server feature.
+      // When fail_on_data_errors is not present, we treat deletions as ambient errors and keep
+      // using the cached resource. When it is present, we delete the cached resource and fail.
       boolean ignoreResourceDeletionEnabled = serverInfo.ignoreResourceDeletion();
-      if (ignoreResourceDeletionEnabled && type.isFullStateOfTheWorld() && data != null) {
-        if (!resourceDeletionIgnored) {
+      boolean failOnDataErrors = serverInfo.failOnDataErrors();
+      if (type.isFullStateOfTheWorld() && data != null && !failOnDataErrors) {
+        if (ignoreResourceDeletionEnabled && !resourceDeletionIgnored) {
           logger.log(XdsLogLevel.FORCE_WARNING,
               "xds server {0}: ignoring deletion for resource type {1} name {2}}",
               serverInfo.target(), type, resource);

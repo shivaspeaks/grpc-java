@@ -1448,6 +1448,66 @@ public abstract class GrpcXdsClientImplTestBase {
     verifyNoMoreInteractions(ldsResourceWatcher);
   }
 
+  /**
+   * When fail_on_data_errors server feature is on, xDS client should delete the cached listener
+   * and fail RPCs when LDS resource is deleted.
+   */
+  @Test
+  public void ldsResourceDeleted_failOnDataErrors() {
+    BootstrapperImpl.xdsDataErrorHandlingEnabled = true;
+    xdsServerInfo = ServerInfo.create(SERVER_URI, CHANNEL_CREDENTIALS, false,
+        true, false, true);
+    BootstrapInfo bootstrapInfo =
+        Bootstrapper.BootstrapInfo.builder()
+            .servers(Collections.singletonList(xdsServerInfo))
+            .node(NODE)
+            .authorities(ImmutableMap.of(
+                "",
+                AuthorityInfo.create(
+                    "xdstp:///envoy.config.listener.v3.Listener/%s",
+                    ImmutableList.of(Bootstrapper.ServerInfo.create(
+                        SERVER_URI_EMPTY_AUTHORITY, CHANNEL_CREDENTIALS)))))
+            .certProviders(ImmutableMap.of())
+            .build();
+    xdsClient = new XdsClientImpl(
+        xdsTransportFactory,
+        bootstrapInfo,
+        fakeClock.getScheduledExecutorService(),
+        backoffPolicyProvider,
+        fakeClock.getStopwatchSupplier(),
+        timeProvider,
+        MessagePrinter.INSTANCE,
+        new TlsContextManagerImpl(bootstrapInfo),
+        xdsClientMetricReporter);
+
+    InOrder inOrder = inOrder(ldsResourceWatcher);
+    DiscoveryRpcCall call = startResourceWatcher(XdsListenerResource.getInstance(), LDS_RESOURCE,
+        ldsResourceWatcher);
+    verifyResourceMetadataRequested(LDS, LDS_RESOURCE);
+
+    // Initial LDS response.
+    call.sendResponse(LDS, testListenerVhosts, VERSION_1, "0000");
+    call.verifyRequest(LDS, LDS_RESOURCE, VERSION_1, "0000", NODE);
+    inOrder.verify(ldsResourceWatcher).onResourceChanged(ldsUpdateCaptor.capture());
+    StatusOr<LdsUpdate> statusOrUpdate = ldsUpdateCaptor.getValue();
+    assertThat(statusOrUpdate.hasValue()).isTrue();
+    verifyGoldenListenerVhosts(statusOrUpdate.getValue());
+    verifyResourceMetadataAcked(LDS, LDS_RESOURCE, testListenerVhosts, VERSION_1, TIME_INCREMENT);
+    verifySubscribedResourcesMetadataSizes(1, 0, 0, 0);
+
+    // Empty LDS response deletes the listener and fails RPCs.
+    call.sendResponse(LDS, Collections.<Any>emptyList(), VERSION_2, "0001");
+    call.verifyRequest(LDS, LDS_RESOURCE, VERSION_2, "0001", NODE);
+    inOrder.verify(ldsResourceWatcher).onResourceChanged(ldsUpdateCaptor.capture());
+    StatusOr<LdsUpdate> statusOrUpdate1 = ldsUpdateCaptor.getValue();
+    assertThat(statusOrUpdate1.hasValue()).isFalse();
+    assertThat(statusOrUpdate1.getStatus().getCode()).isEqualTo(Status.Code.NOT_FOUND);
+    verifyResourceMetadataDoesNotExist(LDS, LDS_RESOURCE);
+    verifySubscribedResourcesMetadataSizes(1, 0, 0, 0);
+
+    BootstrapperImpl.xdsDataErrorHandlingEnabled = false;
+  }
+
   @Test
   @SuppressWarnings("unchecked")
   public void multipleLdsWatchers() {
@@ -2970,6 +3030,64 @@ public abstract class GrpcXdsClientImplTestBase {
         TIME_INCREMENT * 3);
     verifySubscribedResourcesMetadataSizes(0, 1, 0, 0);
     verifyNoMoreInteractions(ldsResourceWatcher);
+  }
+
+  /**
+   * When fail_on_data_errors server feature is on, xDS client should delete the cached cluster
+   * and fail RPCs when CDS resource is deleted.
+   */
+  @Test
+  public void cdsResourceDeleted_failOnDataErrors() {
+    BootstrapperImpl.xdsDataErrorHandlingEnabled = true;
+    xdsServerInfo = ServerInfo.create(SERVER_URI, CHANNEL_CREDENTIALS, false,
+        true, false, true);
+    BootstrapInfo bootstrapInfo =
+        Bootstrapper.BootstrapInfo.builder()
+            .servers(Collections.singletonList(xdsServerInfo))
+            .node(NODE)
+            .authorities(ImmutableMap.of(
+                "",
+                AuthorityInfo.create(
+                    "xdstp:///envoy.config.listener.v3.Listener/%s",
+                    ImmutableList.of(Bootstrapper.ServerInfo.create(
+                        SERVER_URI_EMPTY_AUTHORITY, CHANNEL_CREDENTIALS)))))
+            .certProviders(ImmutableMap.of())
+            .build();
+    xdsClient = new XdsClientImpl(
+        xdsTransportFactory,
+        bootstrapInfo,
+        fakeClock.getScheduledExecutorService(),
+        backoffPolicyProvider,
+        fakeClock.getStopwatchSupplier(),
+        timeProvider,
+        MessagePrinter.INSTANCE,
+        new TlsContextManagerImpl(bootstrapInfo),
+        xdsClientMetricReporter);
+
+    DiscoveryRpcCall call = startResourceWatcher(XdsClusterResource.getInstance(), CDS_RESOURCE,
+        cdsResourceWatcher);
+    verifyResourceMetadataRequested(CDS, CDS_RESOURCE);
+
+    // Initial CDS response.
+    call.sendResponse(CDS, testClusterRoundRobin, VERSION_1, "0000");
+    call.verifyRequest(CDS, CDS_RESOURCE, VERSION_1, "0000", NODE);
+    verify(cdsResourceWatcher).onResourceChanged(cdsUpdateCaptor.capture());
+    StatusOr<CdsUpdate> statusOrUpdate = cdsUpdateCaptor.getValue();
+    assertThat(statusOrUpdate.hasValue()).isTrue();
+    verifyGoldenClusterRoundRobin(statusOrUpdate.getValue());
+    verifyResourceMetadataAcked(CDS, CDS_RESOURCE, testClusterRoundRobin, VERSION_1,
+        TIME_INCREMENT);
+    verifySubscribedResourcesMetadataSizes(0, 1, 0, 0);
+
+    // Empty CDS response deletes the cluster and fails RPCs.
+    call.sendResponse(CDS, Collections.<Any>emptyList(), VERSION_2, "0001");
+    call.verifyRequest(CDS, CDS_RESOURCE, VERSION_2, "0001", NODE);
+    verify(cdsResourceWatcher).onResourceChanged(argThat(
+        arg -> !arg.hasValue() && arg.getStatus().getDescription().contains(CDS_RESOURCE)));
+    verifyResourceMetadataDoesNotExist(CDS, CDS_RESOURCE);
+    verifySubscribedResourcesMetadataSizes(0, 1, 0, 0);
+
+    BootstrapperImpl.xdsDataErrorHandlingEnabled = false;
   }
 
   @Test
