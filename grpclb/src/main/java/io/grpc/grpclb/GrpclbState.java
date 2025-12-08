@@ -37,20 +37,21 @@ import io.grpc.ConnectivityState;
 import io.grpc.ConnectivityStateInfo;
 import io.grpc.Context;
 import io.grpc.EquivalentAddressGroup;
-import io.grpc.LoadBalancer.CreateSubchannelArgs;
+import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.PickResult;
 import io.grpc.LoadBalancer.PickSubchannelArgs;
+import io.grpc.LoadBalancer.ResolvedAddresses;
 import io.grpc.LoadBalancer.Subchannel;
 import io.grpc.LoadBalancer.SubchannelPicker;
-import io.grpc.LoadBalancer.SubchannelStateListener;
+import io.grpc.LoadBalancerProvider;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.SynchronizationContext.ScheduledHandle;
-import io.grpc.grpclb.SubchannelPool.PooledSubchannelStateListener;
 import io.grpc.internal.BackoffPolicy;
+import io.grpc.internal.PickFirstLoadBalancerProvider;
 import io.grpc.internal.TimeProvider;
 import io.grpc.lb.v1.ClientStats;
 import io.grpc.lb.v1.InitialLoadBalanceRequest;
@@ -62,6 +63,7 @@ import io.grpc.lb.v1.LoadBalancerGrpc;
 import io.grpc.lb.v1.Server;
 import io.grpc.lb.v1.ServerList;
 import io.grpc.stub.StreamObserver;
+import io.grpc.util.ForwardingLoadBalancerHelper;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
@@ -69,12 +71,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -141,16 +143,13 @@ final class GrpclbState {
   private final Helper helper;
   private final Context context;
   private final SynchronizationContext syncContext;
-  @Nullable
-  private final SubchannelPool subchannelPool;
   private final TimeProvider time;
   private final Stopwatch stopwatch;
   private final ScheduledExecutorService timerService;
 
-  private static final Attributes.Key<AtomicReference<ConnectivityStateInfo>> STATE_INFO =
-      Attributes.Key.create("io.grpc.grpclb.GrpclbLoadBalancer.stateInfo");
   private final BackoffPolicy.Provider backoffPolicyProvider;
   private final ChannelLogger logger;
+  private final LoadBalancerProvider pickFirstLbProvider;
 
   // Scheduled only once.  Never reset.
   @Nullable
@@ -174,7 +173,10 @@ final class GrpclbState {
 
   @Nullable
   private LbStream lbStream;
-  private Map<List<EquivalentAddressGroup>, Subchannel> subchannels = Collections.emptyMap();
+  
+  // Child load balancers for each backend address (keyed by EAG).
+  // Uses LinkedHashMap to preserve insertion order for round-robin.
+  private Map<EquivalentAddressGroup, ChildLbState> childLbStates = new LinkedHashMap<>();
   private final GrpclbConfig config;
 
   // Has the same size as the round-robin list from the balancer.
@@ -186,12 +188,13 @@ final class GrpclbState {
   private RoundRobinPicker currentPicker =
       new RoundRobinPicker(Collections.<DropEntry>emptyList(), Arrays.asList(BUFFER_ENTRY));
   private boolean requestConnectionPending;
+  // Set to true while we're processing an update, to prevent recursive updates
+  private boolean resolvingAddresses;
 
   GrpclbState(
       GrpclbConfig config,
       Helper helper,
       Context context,
-      SubchannelPool subchannelPool,
       TimeProvider time,
       Stopwatch stopwatch,
       BackoffPolicy.Provider backoffPolicyProvider) {
@@ -199,23 +202,11 @@ final class GrpclbState {
     this.helper = checkNotNull(helper, "helper");
     this.context = checkNotNull(context, "context");
     this.syncContext = checkNotNull(helper.getSynchronizationContext(), "syncContext");
-    if (config.getMode() == Mode.ROUND_ROBIN) {
-      this.subchannelPool = checkNotNull(subchannelPool, "subchannelPool");
-      subchannelPool.registerListener(
-          new PooledSubchannelStateListener() {
-            @Override
-            public void onSubchannelState(
-                Subchannel subchannel, ConnectivityStateInfo newState) {
-              handleSubchannelState(subchannel, newState);
-            }
-          });
-    } else {
-      this.subchannelPool = null;
-    }
     this.time = checkNotNull(time, "time provider");
     this.stopwatch = checkNotNull(stopwatch, "stopwatch");
     this.timerService = checkNotNull(helper.getScheduledExecutorService(), "timerService");
     this.backoffPolicyProvider = checkNotNull(backoffPolicyProvider, "backoffPolicyProvider");
+    this.pickFirstLbProvider = new PickFirstLoadBalancerProvider();
     if (config.getServiceName() != null) {
       this.serviceName = config.getServiceName();
     } else {
@@ -226,28 +217,23 @@ final class GrpclbState {
     logger.log(ChannelLogLevel.INFO, "[grpclb-<{0}>] Created", serviceName);
   }
 
-  void handleSubchannelState(Subchannel subchannel, ConnectivityStateInfo newState) {
-    if (newState.getState() == SHUTDOWN || !subchannels.containsValue(subchannel)) {
+  /**
+   * Handles state change from a child load balancer.
+   */
+  private void handleChildLbStateChange(ChildLbState childLbState,
+      ConnectivityState newState, SubchannelPicker newPicker) {
+    if (childLbState.currentState == SHUTDOWN) {
       return;
     }
-    if (config.getMode() == Mode.ROUND_ROBIN && newState.getState() == IDLE) {
-      subchannel.requestConnection();
-    }
-    if (newState.getState() == TRANSIENT_FAILURE || newState.getState() == IDLE) {
+
+    childLbState.currentState = newState;
+    childLbState.currentPicker = newPicker;
+
+    if (newState == TRANSIENT_FAILURE || newState == IDLE) {
       helper.refreshNameResolution();
     }
 
-    AtomicReference<ConnectivityStateInfo> stateInfoRef =
-        subchannel.getAttributes().get(STATE_INFO);
-    // If all RR servers are unhealthy, it's possible that at least one connection is CONNECTING at
-    // every moment which causes RR to stay in CONNECTING. It's better to keep the TRANSIENT_FAILURE
-    // state in that case so that fail-fast RPCs can fail fast.
-    boolean keepState =
-        config.getMode() == Mode.ROUND_ROBIN
-        && stateInfoRef.get().getState() == TRANSIENT_FAILURE
-        && (newState.getState() == CONNECTING || newState.getState() == IDLE);
-    if (!keepState) {
-      stateInfoRef.set(newState);
+    if (!resolvingAddresses) {
       maybeUseFallbackBackends();
       maybeUpdatePicker();
     }
@@ -323,15 +309,18 @@ final class GrpclbState {
     }
     // Balancer RPC should have either been broken or timed out.
     checkState(fallbackReason != null, "no reason to fallback");
-    for (Subchannel subchannel : subchannels.values()) {
-      ConnectivityStateInfo stateInfo = subchannel.getAttributes().get(STATE_INFO).get();
-      if (stateInfo.getState() == READY) {
+    for (ChildLbState childLbState : childLbStates.values()) {
+      if (childLbState.currentState == READY) {
         return;
       }
       // If we do have balancer-provided backends, use one of its error in the error message if
       // fail to fallback.
-      if (stateInfo.getState() == TRANSIENT_FAILURE) {
-        fallbackReason = stateInfo.getStatus();
+      if (childLbState.currentState == TRANSIENT_FAILURE) {
+        PickResult pickResult = childLbState.currentPicker.pickSubchannel(
+            new PickSubchannelArgsImpl());
+        if (pickResult.getStatus() != null && !pickResult.getStatus().isOk()) {
+          fallbackReason = pickResult.getStatus();
+        }
       }
     }
     // Fallback conditions met
@@ -428,25 +417,11 @@ final class GrpclbState {
   void shutdown() {
     logger.log(ChannelLogLevel.INFO, "[grpclb-<{0}>] Shutdown", serviceName);
     shutdownLbComm();
-    switch (config.getMode()) {
-      case ROUND_ROBIN:
-        // We close the subchannels through subchannelPool instead of helper just for convenience of
-        // testing.
-        for (Subchannel subchannel : subchannels.values()) {
-          returnSubchannelToPool(subchannel);
-        }
-        subchannelPool.clear();
-        break;
-      case PICK_FIRST:
-        if (!subchannels.isEmpty()) {
-          checkState(subchannels.size() == 1, "Excessive Subchannels: %s", subchannels);
-          subchannels.values().iterator().next().shutdown();
-        }
-        break;
-      default:
-        throw new AssertionError("Missing case for " + config.getMode());
+    // Shutdown all child load balancers
+    for (ChildLbState childLbState : childLbStates.values()) {
+      childLbState.shutdown();
     }
-    subchannels = Collections.emptyMap();
+    childLbStates.clear();
     cancelFallbackTimer();
     cancelLbRpcRetryTimer();
   }
@@ -461,10 +436,6 @@ final class GrpclbState {
     }
   }
 
-  private void returnSubchannelToPool(Subchannel subchannel) {
-    subchannelPool.returnSubchannel(subchannel, subchannel.getAttributes().get(STATE_INFO).get());
-  }
-
   @VisibleForTesting
   @Nullable
   GrpclbClientLoadRecorder getLoadRecorder() {
@@ -476,100 +447,159 @@ final class GrpclbState {
 
   /**
    * Populate backend servers to be used based on the given list of addresses.
+   * Uses child pick_first load balancers for each backend address (dualstack support).
    */
   private void updateServerList(
       List<DropEntry> newDropList, List<BackendAddressGroup> newBackendAddrList,
       @Nullable GrpclbClientLoadRecorder loadRecorder) {
-    HashMap<List<EquivalentAddressGroup>, Subchannel> newSubchannelMap =
-        new HashMap<>();
+    
+    try {
+      resolvingAddresses = true;
+
+      switch (config.getMode()) {
+        case ROUND_ROBIN:
+          updateServerListRoundRobin(newDropList, newBackendAddrList, loadRecorder);
+          break;
+        case PICK_FIRST:
+          updateServerListPickFirst(newDropList, newBackendAddrList, loadRecorder);
+          break;
+        default:
+          throw new AssertionError("Missing case for " + config.getMode());
+      }
+    } finally {
+      resolvingAddresses = false;
+    }
+  }
+
+  /**
+   * Updates server list for ROUND_ROBIN mode using child pick_first LBs.
+   */
+  private void updateServerListRoundRobin(
+      List<DropEntry> newDropList, List<BackendAddressGroup> newBackendAddrList,
+      @Nullable GrpclbClientLoadRecorder loadRecorder) {
+    
+    Map<EquivalentAddressGroup, ChildLbState> newChildLbStates = new LinkedHashMap<>();
     List<BackendEntry> newBackendList = new ArrayList<>();
 
-    switch (config.getMode()) {
-      case ROUND_ROBIN:
-        for (BackendAddressGroup backendAddr : newBackendAddrList) {
-          EquivalentAddressGroup eag = backendAddr.getAddresses();
-          List<EquivalentAddressGroup> eagAsList = Collections.singletonList(eag);
-          Subchannel subchannel = newSubchannelMap.get(eagAsList);
-          if (subchannel == null) {
-            subchannel = subchannels.get(eagAsList);
-            if (subchannel == null) {
-              subchannel = subchannelPool.takeOrCreateSubchannel(eag, createSubchannelAttrs());
-              subchannel.requestConnection();
-            }
-            newSubchannelMap.put(eagAsList, subchannel);
-          }
-          BackendEntry entry;
-          // Only picks with tokens are reported to LoadRecorder
-          if (backendAddr.getToken() == null) {
-            entry = new BackendEntry(subchannel);
-          } else {
-            entry = new BackendEntry(subchannel, loadRecorder, backendAddr.getToken());
-          }
-          newBackendList.add(entry);
-        }
-        // Close Subchannels whose addresses have been delisted
-        for (Map.Entry<List<EquivalentAddressGroup>, Subchannel> entry : subchannels.entrySet()) {
-          List<EquivalentAddressGroup> eagList = entry.getKey();
-          if (!newSubchannelMap.containsKey(eagList)) {
-            returnSubchannelToPool(entry.getValue());
-          }
-        }
-        subchannels = Collections.unmodifiableMap(newSubchannelMap);
-        break;
-      case PICK_FIRST:
-        checkState(subchannels.size() <= 1, "Unexpected Subchannel count: %s", subchannels);
-        final Subchannel subchannel;
-        if (newBackendAddrList.isEmpty()) {
-          if (subchannels.size() == 1) {
-            subchannel = subchannels.values().iterator().next();
-            subchannel.shutdown();
-            subchannels = Collections.emptyMap();
-          }
-          break;
-        }
-        List<EquivalentAddressGroup> eagList = new ArrayList<>();
-        // Because for PICK_FIRST, we create a single Subchannel for all addresses, we have to
-        // attach the tokens to the EAG attributes and use TokenAttachingLoadRecorder to put them on
-        // headers.
-        //
-        // The PICK_FIRST code path doesn't cache Subchannels.
-        for (BackendAddressGroup bag : newBackendAddrList) {
-          EquivalentAddressGroup origEag = bag.getAddresses();
-          Attributes eagAttrs = origEag.getAttributes();
-          if (bag.getToken() != null) {
-            eagAttrs = eagAttrs.toBuilder()
-                .set(GrpclbConstants.TOKEN_ATTRIBUTE_KEY, bag.getToken()).build();
-          }
-          eagList.add(new EquivalentAddressGroup(origEag.getAddresses(), eagAttrs));
-        }
-        if (subchannels.isEmpty()) {
-          subchannel =
-              helper.createSubchannel(
-                  CreateSubchannelArgs.newBuilder()
-                      .setAddresses(eagList)
-                      .setAttributes(createSubchannelAttrs())
-                      .build());
-          subchannel.start(new SubchannelStateListener() {
-            @Override
-            public void onSubchannelState(ConnectivityStateInfo newState) {
-              handleSubchannelState(subchannel, newState);
-            }
-          });
-          if (requestConnectionPending) {
-            subchannel.requestConnection();
-            requestConnectionPending = false;
-          }
-        } else {
-          subchannel = subchannels.values().iterator().next();
-          subchannel.updateAddresses(eagList);
-        }
-        subchannels = Collections.singletonMap(eagList, subchannel);
-        newBackendList.add(
-            new BackendEntry(subchannel, new TokenAttachingTracerFactory(loadRecorder)));
-        break;
-      default:
-        throw new AssertionError("Missing case for " + config.getMode());
+    for (BackendAddressGroup backendAddr : newBackendAddrList) {
+      EquivalentAddressGroup eag = backendAddr.getAddresses();
+      
+      // Reuse existing child LB if available, otherwise create new one
+      ChildLbState childLbState = childLbStates.get(eag);
+      if (childLbState == null) {
+        childLbState = new ChildLbState(eag, backendAddr.getToken());
+      } else {
+        // Update token for existing child
+        childLbState.token = backendAddr.getToken();
+      }
+      
+      // Only add unique addresses to the map (first occurrence wins)
+      if (!newChildLbStates.containsKey(eag)) {
+        newChildLbStates.put(eag, childLbState);
+      }
+      
+      // Create backend entry for this address occurrence in the server list
+      BackendEntry entry = new BackendEntry(childLbState, loadRecorder, backendAddr.getToken());
+      newBackendList.add(entry);
     }
+
+    // Shutdown child LBs that are no longer needed
+    for (Map.Entry<EquivalentAddressGroup, ChildLbState> entry : childLbStates.entrySet()) {
+      if (!newChildLbStates.containsKey(entry.getKey())) {
+        entry.getValue().shutdown();
+      }
+    }
+
+    // Update child LBs with resolved addresses
+    for (Map.Entry<EquivalentAddressGroup, ChildLbState> entry : newChildLbStates.entrySet()) {
+      EquivalentAddressGroup eag = entry.getKey();
+      ChildLbState childLbState = entry.getValue();
+      
+      ResolvedAddresses childAddresses = ResolvedAddresses.newBuilder()
+          .setAddresses(Collections.singletonList(eag))
+          .setAttributes(Attributes.newBuilder()
+              .set(LoadBalancer.IS_PETIOLE_POLICY, true)
+              .build())
+          .build();
+      childLbState.lb.acceptResolvedAddresses(childAddresses);
+      childLbState.lb.requestConnection();
+    }
+
+    childLbStates = newChildLbStates;
+    dropList = Collections.unmodifiableList(newDropList);
+    backendList = Collections.unmodifiableList(newBackendList);
+  }
+
+  /**
+   * Updates server list for PICK_FIRST mode using a single child pick_first LB.
+   */
+  private void updateServerListPickFirst(
+      List<DropEntry> newDropList, List<BackendAddressGroup> newBackendAddrList,
+      @Nullable GrpclbClientLoadRecorder loadRecorder) {
+    
+    List<BackendEntry> newBackendList = new ArrayList<>();
+
+    if (newBackendAddrList.isEmpty()) {
+      // No backends: shutdown all children
+      for (ChildLbState childLbState : childLbStates.values()) {
+        childLbState.shutdown();
+      }
+      childLbStates.clear();
+      dropList = Collections.unmodifiableList(newDropList);
+      backendList = Collections.emptyList();
+      return;
+    }
+
+    // Build list of EAGs with tokens attached as attributes
+    List<EquivalentAddressGroup> eagList = new ArrayList<>();
+    for (BackendAddressGroup bag : newBackendAddrList) {
+      EquivalentAddressGroup origEag = bag.getAddresses();
+      Attributes eagAttrs = origEag.getAttributes();
+      if (bag.getToken() != null) {
+        eagAttrs = eagAttrs.toBuilder()
+            .set(GrpclbConstants.TOKEN_ATTRIBUTE_KEY, bag.getToken()).build();
+      }
+      eagList.add(new EquivalentAddressGroup(origEag.getAddresses(), eagAttrs));
+    }
+
+    // Use a synthetic key for the single child LB in PICK_FIRST mode
+    EquivalentAddressGroup syntheticKey = new EquivalentAddressGroup(
+        eagList.get(0).getAddresses(), LB_PROVIDED_BACKEND_ATTRS);
+    
+    ChildLbState childLbState = childLbStates.values().isEmpty() 
+        ? null 
+        : childLbStates.values().iterator().next();
+    
+    if (childLbState == null) {
+      childLbState = new ChildLbState(syntheticKey, null);
+      if (requestConnectionPending) {
+        childLbState.lb.requestConnection();
+        requestConnectionPending = false;
+      }
+    }
+
+    // Shutdown any extra children (should only be one in PICK_FIRST mode)
+    for (ChildLbState oldState : childLbStates.values()) {
+      if (oldState != childLbState) {
+        oldState.shutdown();
+      }
+    }
+
+    Map<EquivalentAddressGroup, ChildLbState> newChildLbStates = new LinkedHashMap<>();
+    newChildLbStates.put(syntheticKey, childLbState);
+    
+    // Update the child LB with all addresses
+    ResolvedAddresses childAddresses = ResolvedAddresses.newBuilder()
+        .setAddresses(eagList)
+        .setAttributes(Attributes.newBuilder()
+            .set(LoadBalancer.IS_PETIOLE_POLICY, true)
+            .build())
+        .build();
+    childLbState.lb.acceptResolvedAddresses(childAddresses);
+
+    childLbStates = newChildLbStates;
+    newBackendList.add(new BackendEntry(childLbState, 
+        new TokenAttachingTracerFactory(loadRecorder)));
 
     dropList = Collections.unmodifiableList(newDropList);
     backendList = Collections.unmodifiableList(newBackendList);
@@ -836,7 +866,7 @@ final class GrpclbState {
   }
 
   /**
-   * Make and use a picker out of the current lists and the states of subchannels if they have
+   * Make and use a picker out of the current lists and the states of child LBs if they have
    * changed since the last picker created.
    */
   private void maybeUpdatePicker() {
@@ -870,13 +900,19 @@ final class GrpclbState {
         Status error = null;
         boolean hasPending = false;
         for (BackendEntry entry : backendList) {
-          Subchannel subchannel = entry.subchannel;
-          Attributes attrs = subchannel.getAttributes();
-          ConnectivityStateInfo stateInfo = attrs.get(STATE_INFO).get();
-          if (stateInfo.getState() == READY) {
+          ChildLbState childLbState = entry.childLbState;
+          ConnectivityState childState = childLbState.currentState;
+          if (childState == READY) {
             pickList.add(entry);
-          } else if (stateInfo.getState() == TRANSIENT_FAILURE) {
-            error = stateInfo.getStatus();
+          } else if (childState == TRANSIENT_FAILURE) {
+            // Get error from child picker
+            PickResult pickResult = childLbState.currentPicker.pickSubchannel(
+                new PickSubchannelArgsImpl());
+            if (pickResult.getStatus() != null && !pickResult.getStatus().isOk()) {
+              error = pickResult.getStatus();
+            } else {
+              error = Status.UNAVAILABLE.withDescription("Backend unavailable");
+            }
           } else {
             hasPending = true;
           }
@@ -896,23 +932,27 @@ final class GrpclbState {
       case PICK_FIRST: {
         checkState(backendList.size() == 1, "Excessive backend entries: %s", backendList);
         BackendEntry onlyEntry = backendList.get(0);
-        ConnectivityStateInfo stateInfo =
-            onlyEntry.subchannel.getAttributes().get(STATE_INFO).get();
-        state = stateInfo.getState();
+        ChildLbState childLbState = onlyEntry.childLbState;
+        state = childLbState.currentState;
         switch (state) {
           case READY:
             pickList = Collections.<RoundRobinEntry>singletonList(onlyEntry);
             break;
           case TRANSIENT_FAILURE:
-            pickList =
-                Collections.<RoundRobinEntry>singletonList(new ErrorEntry(stateInfo.getStatus()));
+            PickResult pickResult = childLbState.currentPicker.pickSubchannel(
+                new PickSubchannelArgsImpl());
+            Status errorStatus = pickResult.getStatus() != null 
+                ? pickResult.getStatus() 
+                : Status.UNAVAILABLE.withDescription("Backend unavailable");
+            pickList = Collections.<RoundRobinEntry>singletonList(new ErrorEntry(errorStatus));
             break;
           case CONNECTING:
             pickList = Collections.singletonList(BUFFER_ENTRY);
             break;
           default:
+            // IDLE state - request connection
             pickList = Collections.<RoundRobinEntry>singletonList(
-                new IdleSubchannelEntry(onlyEntry.subchannel, syncContext));
+                new IdleChildLbEntry(childLbState, syncContext));
         }
         break;
       }
@@ -937,12 +977,83 @@ final class GrpclbState {
     helper.updateBalancingState(state, picker);
   }
 
-  private static Attributes createSubchannelAttrs() {
-    return Attributes.newBuilder()
-        .set(STATE_INFO,
-            new AtomicReference<>(
-                ConnectivityStateInfo.forNonError(IDLE)))
-        .build();
+  /**
+   * State for a child load balancer (pick_first) managing a single backend address.
+   * Each backend address from the grpclb server gets its own ChildLbState.
+   */
+  final class ChildLbState {
+    final EquivalentAddressGroup eag;
+    final LoadBalancer lb;
+    @Nullable
+    String token;
+    ConnectivityState currentState = CONNECTING;
+    SubchannelPicker currentPicker = 
+        new FixedResultPicker(PickResult.withNoResult());
+
+    ChildLbState(EquivalentAddressGroup eag, @Nullable String token) {
+      this.eag = checkNotNull(eag, "eag");
+      this.token = token;
+      this.lb = pickFirstLbProvider.newLoadBalancer(new ChildLbHelper());
+    }
+
+    void shutdown() {
+      lb.shutdown();
+      currentState = SHUTDOWN;
+    }
+
+    /**
+     * Helper for child load balancer that forwards most calls to the parent helper
+     * but intercepts updateBalancingState to aggregate child states.
+     */
+    private class ChildLbHelper extends ForwardingLoadBalancerHelper {
+      @Override
+      protected Helper delegate() {
+        return helper;
+      }
+
+      @Override
+      public void updateBalancingState(ConnectivityState newState, SubchannelPicker newPicker) {
+        handleChildLbStateChange(ChildLbState.this, newState, newPicker);
+      }
+    }
+  }
+
+  /**
+   * A picker that returns a fixed result.
+   */
+  private static final class FixedResultPicker extends SubchannelPicker {
+    private final PickResult result;
+
+    FixedResultPicker(PickResult result) {
+      this.result = checkNotNull(result, "result");
+    }
+
+    @Override
+    public PickResult pickSubchannel(PickSubchannelArgs args) {
+      return result;
+    }
+  }
+
+  /**
+   * Simple implementation of PickSubchannelArgs for internal use.
+   */
+  private static final class PickSubchannelArgsImpl extends PickSubchannelArgs {
+    private final Metadata headers = new Metadata();
+
+    @Override
+    public Metadata getHeaders() {
+      return headers;
+    }
+
+    @Override
+    public io.grpc.CallOptions getCallOptions() {
+      return io.grpc.CallOptions.DEFAULT;
+    }
+
+    @Override
+    public io.grpc.MethodDescriptor<?, ?> getMethodDescriptor() {
+      return null;
+    }
   }
 
   @VisibleForTesting
@@ -988,59 +1099,69 @@ final class GrpclbState {
 
   @VisibleForTesting
   static final class BackendEntry implements RoundRobinEntry {
-    final Subchannel subchannel;
-    @VisibleForTesting
-    final PickResult result;
+    final ChildLbState childLbState;
+    @Nullable
+    private final GrpclbClientLoadRecorder loadRecorder;
     @Nullable
     private final String token;
+    @Nullable
+    private final TokenAttachingTracerFactory tracerFactory;
 
     /**
      * For ROUND_ROBIN: creates a BackendEntry whose usage will be reported to load recorder.
      */
-    BackendEntry(Subchannel subchannel, GrpclbClientLoadRecorder loadRecorder, String token) {
-      this.subchannel = checkNotNull(subchannel, "subchannel");
-      this.result =
-          PickResult.withSubchannel(subchannel, checkNotNull(loadRecorder, "loadRecorder"));
-      this.token = checkNotNull(token, "token");
+    BackendEntry(ChildLbState childLbState, @Nullable GrpclbClientLoadRecorder loadRecorder, 
+        @Nullable String token) {
+      this.childLbState = checkNotNull(childLbState, "childLbState");
+      this.loadRecorder = loadRecorder;
+      this.token = token;
+      this.tracerFactory = null;
     }
 
     /**
-     * For ROUND_ROBIN/PICK_FIRST: creates a BackendEntry whose usage will not be reported.
+     * For PICK_FIRST: creates a BackendEntry with a token attaching tracer factory.
      */
-    BackendEntry(Subchannel subchannel) {
-      this.subchannel = checkNotNull(subchannel, "subchannel");
-      this.result = PickResult.withSubchannel(subchannel);
-      this.token = null;
-    }
-
-    /**
-     * For PICK_FIRST: creates a BackendEntry that includes all addresses.
-     */
-    BackendEntry(Subchannel subchannel, TokenAttachingTracerFactory tracerFactory) {
-      this.subchannel = checkNotNull(subchannel, "subchannel");
-      this.result =
-          PickResult.withSubchannel(subchannel, checkNotNull(tracerFactory, "tracerFactory"));
+    BackendEntry(ChildLbState childLbState, TokenAttachingTracerFactory tracerFactory) {
+      this.childLbState = checkNotNull(childLbState, "childLbState");
+      this.tracerFactory = checkNotNull(tracerFactory, "tracerFactory");
+      this.loadRecorder = null;
       this.token = null;
     }
 
     @Override
     public PickResult picked(Metadata headers) {
+      // Delegate to child's picker to get the actual subchannel
+      PickResult childResult = childLbState.currentPicker.pickSubchannel(
+          new PickSubchannelArgsImpl());
+      
+      if (childResult.getSubchannel() == null) {
+        return childResult;
+      }
+      
+      // Attach token to headers if present
       headers.discardAll(GrpclbConstants.TOKEN_METADATA_KEY);
       if (token != null) {
         headers.put(GrpclbConstants.TOKEN_METADATA_KEY, token);
       }
-      return result;
+      
+      // Create appropriate PickResult with stream tracer if needed
+      if (loadRecorder != null && token != null) {
+        return PickResult.withSubchannel(childResult.getSubchannel(), loadRecorder);
+      } else if (tracerFactory != null) {
+        return PickResult.withSubchannel(childResult.getSubchannel(), tracerFactory);
+      }
+      return childResult;
     }
 
     @Override
     public String toString() {
-      // This is printed in logs.  Only give out useful information.
-      return "[" + subchannel.getAllAddresses().toString() + "(" + token + ")]";
+      // This is printed in logs. Only give out useful information.
+      return "[" + childLbState.eag.toString() + "(" + token + ")]";
     }
 
     @Override
     public int hashCode() {
-      return Objects.hashCode(result, token);
+      return Objects.hashCode(childLbState, token);
     }
 
     @Override
@@ -1049,7 +1170,8 @@ final class GrpclbState {
         return false;
       }
       BackendEntry that = (BackendEntry) other;
-      return Objects.equal(result, that.result) && Objects.equal(token, that.token);
+      return Objects.equal(childLbState, that.childLbState) 
+          && Objects.equal(token, that.token);
     }
   }
 
@@ -1095,6 +1217,54 @@ final class GrpclbState {
       }
       IdleSubchannelEntry that = (IdleSubchannelEntry) other;
       return Objects.equal(subchannel, that.subchannel)
+          && Objects.equal(syncContext, that.syncContext);
+    }
+  }
+
+  /**
+   * Entry for an idle child LB that requests connection on first pick.
+   */
+  @VisibleForTesting
+  static final class IdleChildLbEntry implements RoundRobinEntry {
+    private final ChildLbState childLbState;
+    private final SynchronizationContext syncContext;
+    private final AtomicBoolean connectionRequested = new AtomicBoolean(false);
+
+    IdleChildLbEntry(ChildLbState childLbState, SynchronizationContext syncContext) {
+      this.childLbState = checkNotNull(childLbState, "childLbState");
+      this.syncContext = checkNotNull(syncContext, "syncContext");
+    }
+
+    @Override
+    public PickResult picked(Metadata headers) {
+      if (connectionRequested.compareAndSet(false, true)) {
+        syncContext.execute(new Runnable() {
+            @Override
+            public void run() {
+              childLbState.lb.requestConnection();
+            }
+          });
+      }
+      return PickResult.withNoResult();
+    }
+
+    @Override
+    public String toString() {
+      return "(idle)[" + childLbState.eag.toString() + "]";
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(childLbState, syncContext);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (!(other instanceof IdleChildLbEntry)) {
+        return false;
+      }
+      IdleChildLbEntry that = (IdleChildLbEntry) other;
+      return Objects.equal(childLbState, that.childLbState)
           && Objects.equal(syncContext, that.syncContext);
     }
   }

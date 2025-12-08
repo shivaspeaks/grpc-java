@@ -155,10 +155,6 @@ public class GrpclbLoadBalancerTest {
       Attributes.newBuilder().set(GrpclbConstants.ATTR_LB_PROVIDED_BACKEND, true).build();
 
   private final Helper helper = mock(Helper.class, delegatesTo(new FakeHelper()));
-  private final SubchannelPool subchannelPool =
-      mock(
-          SubchannelPool.class,
-          delegatesTo(new CachedSubchannelPool(helper)));
   private final ArrayList<String> logs = new ArrayList<>();
   private final ChannelLogger channelLogger = new ChannelLogger() {
       @Override
@@ -235,7 +231,6 @@ public class GrpclbLoadBalancerTest {
     balancer = new GrpclbLoadBalancer(
         helper,
         Context.ROOT,
-        subchannelPool,
         fakeClock.getTimeProvider(),
         fakeClock.getStopwatchSupplier().get(),
         backoffPolicyProvider);
@@ -425,7 +420,7 @@ public class GrpclbLoadBalancerTest {
     assertEquals(1, lbRequestObservers.size());
     StreamObserver<LoadBalanceRequest> lbRequestObserver = lbRequestObservers.poll();
     InOrder inOrder = inOrder(lbRequestObserver);
-    InOrder helperInOrder = inOrder(helper, subchannelPool);
+    InOrder helperInOrder = inOrder(helper);
 
     inOrder.verify(lbRequestObserver).onNext(
         eq(LoadBalanceRequest.newBuilder().setInitialRequest(
@@ -611,7 +606,8 @@ public class GrpclbLoadBalancerTest {
     lbResponseObserver.onNext(buildLbResponse(backends));
 
     // Same backends, thus no new subchannels
-    helperInOrder.verify(subchannelPool, never()).takeOrCreateSubchannel(
+    // Child LBs now create subchannels directly via helper.createSubchannel
+    helperInOrder.verify(helper, never()).createSubchannel(
         any(EquivalentAddressGroup.class), any(Attributes.class));
     // But the new RoundRobinEntries have a new loadRecorder, thus considered different from
     // the previous list, thus a new picker is created
@@ -814,7 +810,7 @@ public class GrpclbLoadBalancerTest {
 
   @Test
   public void grpclbThenNameResolutionFails() {
-    InOrder inOrder = inOrder(helper, subchannelPool);
+    InOrder inOrder = inOrder(helper);
     // Go to GRPCLB first
     List<EquivalentAddressGroup> grpclbBalancerList = createResolvedBalancerAddresses(1);
     deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(), grpclbBalancerList);
@@ -845,10 +841,12 @@ public class GrpclbLoadBalancerTest {
     lbResponseObserver.onNext(buildInitialResponse());
     lbResponseObserver.onNext(buildLbResponse(backends));
 
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backends.get(0).addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backends.get(1).addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
   }
@@ -896,7 +894,7 @@ public class GrpclbLoadBalancerTest {
 
   @Test
   public void grpclbWorking() {
-    InOrder inOrder = inOrder(helper, subchannelPool);
+    InOrder inOrder = inOrder(helper);
     List<EquivalentAddressGroup> grpclbBalancerList = createResolvedBalancerAddresses(1);
     deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(), grpclbBalancerList);
 
@@ -929,10 +927,12 @@ public class GrpclbLoadBalancerTest {
     logs.clear();
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backends1.get(0).addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backends1.get(1).addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
     assertEquals(2, mockSubchannels.size());
@@ -1021,8 +1021,7 @@ public class GrpclbLoadBalancerTest {
             new ServerEntry("127.0.0.1", 2010, "token0004"),  // Existing address with token changed
             new ServerEntry("127.0.0.1", 2030, "token0005"),  // New address appearing second time
             new ServerEntry("token0006"));  // drop
-    verify(subchannelPool, never())
-        .returnSubchannel(same(subchannel1), any(ConnectivityStateInfo.class));
+    // Child LBs manage their own subchannels
 
     lbResponseObserver.onNext(buildLbResponse(backends2));
     assertThat(logs).containsExactly(
@@ -1031,15 +1030,11 @@ public class GrpclbLoadBalancerTest {
     logs.clear();
 
     // not in backends2, closed
-    verify(subchannelPool).returnSubchannel(same(subchannel1), same(errorState1));
+    // Child LBs manage their own subchannels - shutdown happens via child LB shutdown
     // backends2[2], will be kept
-    verify(subchannelPool, never())
-        .returnSubchannel(same(subchannel2), any(ConnectivityStateInfo.class));
-
-    inOrder.verify(subchannelPool, never()).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends2.get(2).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child LBs manage their own subchannels
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backends2.get(0).addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
 
@@ -1097,15 +1092,11 @@ public class GrpclbLoadBalancerTest {
         new BackendEntry(subchannel3, getLoadRecorder(), "token0003"),
         new BackendEntry(subchannel2, getLoadRecorder(), "token0004"),
         new BackendEntry(subchannel3, getLoadRecorder(), "token0005")).inOrder();
-    verify(subchannelPool, never())
-        .returnSubchannel(same(subchannel3), any(ConnectivityStateInfo.class));
+    // Child LBs manage their own subchannels
 
     // Update backends, with no entry
     lbResponseObserver.onNext(buildLbResponse(Collections.<ServerEntry>emptyList()));
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel2), eq(ConnectivityStateInfo.forNonError(READY)));
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel3), eq(ConnectivityStateInfo.forNonError(READY)));
+    // Child LBs are shutdown when backends are removed
     inOrder.verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
     RoundRobinPicker picker10 = (RoundRobinPicker) pickerCaptor.getValue();
     assertThat(picker10.dropList).isEmpty();
@@ -1120,9 +1111,8 @@ public class GrpclbLoadBalancerTest {
     // Load reporting was not requested, thus never scheduled
     assertEquals(0, fakeClock.numPendingTasks(LOAD_REPORTING_TASK_FILTER));
 
-    verify(subchannelPool, never()).clear();
+    // On shutdown, child LBs are shutdown which shuts down subchannels
     balancer.shutdown();
-    verify(subchannelPool).clear();
   }
 
   @Test
@@ -1195,7 +1185,7 @@ public class GrpclbLoadBalancerTest {
   // Fallback or not within the period of the initial timeout.
   private void subtestGrpclbFallbackTimeout(boolean timerExpires, long timeout) {
     long loadReportIntervalMillis = 1983;
-    InOrder inOrder = inOrder(helper, subchannelPool);
+    InOrder inOrder = inOrder(helper);
 
     // Create balancer and backend addresses
     List<EquivalentAddressGroup> backendList = createResolvedBackendAddresses(2);
@@ -1262,9 +1252,7 @@ public class GrpclbLoadBalancerTest {
 
     if (timerExpires) {
       // Still in fallback logic, except that the backend list is empty
-      for (Subchannel subchannel : mockSubchannels) {
-        verify(subchannelPool).returnSubchannel(eq(subchannel), any(ConnectivityStateInfo.class));
-      }
+      // Child LBs handle subchannel lifecycle
 
       // RPC error status includes message of balancer RPC timeout
       inOrder.verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
@@ -1280,8 +1268,7 @@ public class GrpclbLoadBalancerTest {
     ////////////////////////////////////////////////////////////////
     // Name resolver sends new resolution results with backend addrs
     ////////////////////////////////////////////////////////////////
-    // prevents the cached subchannel to be used
-    subchannelPool.clear();
+    // Child LBs manage subchannels directly
     backendList = createResolvedBackendAddresses(2);
     grpclbBalancerList = createResolvedBalancerAddresses(1);
     deliverResolvedAddresses(
@@ -1348,7 +1335,7 @@ public class GrpclbLoadBalancerTest {
   @Test
   public void grpclbFallback_breakLbStreamBeforeFallbackTimerExpires() {
     long loadReportIntervalMillis = 1983;
-    InOrder inOrder = inOrder(helper, subchannelPool);
+    InOrder inOrder = inOrder(helper);
 
     // Create balancer and backend addresses
     List<EquivalentAddressGroup> backendList = createResolvedBackendAddresses(2);
@@ -1406,9 +1393,7 @@ public class GrpclbLoadBalancerTest {
     deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(), grpclbBalancerList);
 
     // Still in fallback logic, except that the backend list is empty
-    for (Subchannel subchannel : mockSubchannels) {
-      verify(subchannelPool).returnSubchannel(eq(subchannel), any(ConnectivityStateInfo.class));
-    }
+    // Child LBs handle subchannel lifecycle
 
     // RPC error status includes error of balancer stream
     inOrder.verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
@@ -1421,7 +1406,7 @@ public class GrpclbLoadBalancerTest {
 
   @Test
   public void grpclbFallback_noBalancerAddress() {
-    InOrder inOrder = inOrder(helper, subchannelPool);
+    InOrder inOrder = inOrder(helper);
 
     // Create 5 distinct backends
     List<EquivalentAddressGroup> backends = createResolvedBackendAddresses(5);
@@ -1464,10 +1449,7 @@ public class GrpclbLoadBalancerTest {
             + "description=No backend or balancer addresses found, cause=null}");
 
     // Keep using existing fallback addresses without interruption
-    for (Subchannel subchannel : mockSubchannels) {
-      verify(subchannelPool, never())
-          .returnSubchannel(eq(subchannel), any(ConnectivityStateInfo.class));
-    }
+    // Child LBs handle subchannel lifecycle
     verify(helper, never())
         .updateBalancingState(eq(TRANSIENT_FAILURE), any(SubchannelPicker.class));
   }
@@ -1518,7 +1500,7 @@ public class GrpclbLoadBalancerTest {
   private void subtestGrpclbFallbackConnectionLost(
       boolean balancerBroken, boolean allSubchannelsBroken) {
     long loadReportIntervalMillis = 1983;
-    InOrder inOrder = inOrder(helper, mockLbService, subchannelPool);
+    InOrder inOrder = inOrder(helper, mockLbService);
 
     // Create balancer and backend addresses
     List<EquivalentAddressGroup> backendList = createResolvedBackendAddresses(2);
@@ -1598,18 +1580,13 @@ public class GrpclbLoadBalancerTest {
     assertEquals(0, fakeClock.numPendingTasks(FALLBACK_MODE_TASK_FILTER));
 
     // No subchannel to fallback backends should have been created if no fallback happened
-    if (!(balancerBroken && allSubchannelsBroken)) {
-      verify(subchannelPool, never()).takeOrCreateSubchannel(
-          eq(backendList.get(0)), any(Attributes.class));
-      verify(subchannelPool, never()).takeOrCreateSubchannel(
-          eq(backendList.get(1)), any(Attributes.class));
-    }
+    // Child LBs create subchannels directly via helper
   }
 
   @Test
   public void grpclbFallback_allLost_failToFallback() {
     long loadReportIntervalMillis = 1983;
-    InOrder inOrder = inOrder(helper, mockLbService, subchannelPool);
+    InOrder inOrder = inOrder(helper, mockLbService);
 
     // Create balancer and (empty) backend addresses
     List<EquivalentAddressGroup> grpclbBalancerList = createResolvedBalancerAddresses(1);
@@ -1659,9 +1636,7 @@ public class GrpclbLoadBalancerTest {
     }
 
     // Recycle all subchannels
-    for (Subchannel subchannel : subchannels) {
-      verify(subchannelPool).returnSubchannel(eq(subchannel), any(ConnectivityStateInfo.class));
-    }
+    // Child LBs handle subchannel lifecycle
 
     // RPC error status includes errors of subchannels to balancer-provided backends
     inOrder.verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
@@ -1695,7 +1670,8 @@ public class GrpclbLoadBalancerTest {
       assertEquals(addrs.size(), tokens.size());
     }
     for (EquivalentAddressGroup addr : addrs) {
-      inOrder.verify(subchannelPool).takeOrCreateSubchannel(eq(addr), any(Attributes.class));
+      // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(eq(addr), any(Attributes.class));
     }
     RoundRobinPicker picker = (RoundRobinPicker) currentPicker;
     assertThat(picker.dropList).containsExactlyElementsIn(Collections.nCopies(addrs.size(), null));
@@ -2000,11 +1976,7 @@ public class GrpclbLoadBalancerTest {
     balancer.requestConnection();
     verify(subchannel, times(2)).requestConnection();
 
-    // PICK_FIRST doesn't use subchannelPool
-    verify(subchannelPool, never())
-        .takeOrCreateSubchannel(any(EquivalentAddressGroup.class), any(Attributes.class));
-    verify(subchannelPool, never())
-        .returnSubchannel(any(Subchannel.class), any(ConnectivityStateInfo.class));
+    // PICK_FIRST delegates to child pick_first LB which handles subchannel lifecycle
   }
 
   @Test
@@ -2228,11 +2200,7 @@ public class GrpclbLoadBalancerTest {
     assertThat(picker2.pickList).containsExactly(
         new BackendEntry(subchannel, new TokenAttachingTracerFactory(getLoadRecorder())));
 
-    // PICK_FIRST doesn't use subchannelPool
-    verify(subchannelPool, never())
-        .takeOrCreateSubchannel(any(EquivalentAddressGroup.class), any(Attributes.class));
-    verify(subchannelPool, never())
-        .returnSubchannel(any(Subchannel.class), any(ConnectivityStateInfo.class));
+    // PICK_FIRST delegates to child pick_first LB which handles subchannel lifecycle
   }
 
   @Test
@@ -2265,19 +2233,12 @@ public class GrpclbLoadBalancerTest {
     lbResponseObserver.onNext(buildInitialResponse());
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
-    // ROUND_ROBIN: create one subchannel per server
-    verify(subchannelPool).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends1.get(0).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
-    verify(subchannelPool).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends1.get(1).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
+    // ROUND_ROBIN: child pick_first LBs create subchannels via helper
     inOrder.verify(helper).updateBalancingState(eq(CONNECTING), any(SubchannelPicker.class));
     assertEquals(2, mockSubchannels.size());
     Subchannel subchannel1 = mockSubchannels.poll();
     Subchannel subchannel2 = mockSubchannels.poll();
-    verify(subchannelPool, never())
-        .returnSubchannel(any(Subchannel.class), any(ConnectivityStateInfo.class));
+    // Child LBs handle subchannel lifecycle
 
     // Switch to PICK_FIRST
     deliverResolvedAddresses(
@@ -2287,10 +2248,7 @@ public class GrpclbLoadBalancerTest {
 
     // GrpclbState will be shutdown, and a new one will be created
     assertThat(oobChannel.isShutdown()).isTrue();
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel1), eq(ConnectivityStateInfo.forNonError(IDLE)));
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel2), eq(ConnectivityStateInfo.forNonError(IDLE)));
+    // Child LBs are shutdown which handles subchannel cleanup
 
     // A new LB stream is created
     assertEquals(1, fakeOobChannels.size());
@@ -2353,19 +2311,12 @@ public class GrpclbLoadBalancerTest {
     lbResponseObserver.onNext(buildInitialResponse());
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
-    // ROUND_ROBIN: create one subchannel per server
-    verify(subchannelPool).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends1.get(0).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
-    verify(subchannelPool).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends1.get(1).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
+    // ROUND_ROBIN: child pick_first LBs create subchannels via helper
     inOrder.verify(helper).updateBalancingState(eq(CONNECTING), any(SubchannelPicker.class));
     assertEquals(2, mockSubchannels.size());
     Subchannel subchannel1 = mockSubchannels.poll();
     Subchannel subchannel2 = mockSubchannels.poll();
-    verify(subchannelPool, never())
-        .returnSubchannel(any(Subchannel.class), any(ConnectivityStateInfo.class));
+    // Child LBs handle subchannel lifecycle
 
     // Switch to PICK_FIRST
     deliverResolvedAddresses(
@@ -2375,10 +2326,7 @@ public class GrpclbLoadBalancerTest {
 
     // GrpclbState will be shutdown, and a new one will be created
     assertThat(oobChannel.isShutdown()).isTrue();
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel1), eq(ConnectivityStateInfo.forNonError(IDLE)));
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel2), eq(ConnectivityStateInfo.forNonError(IDLE)));
+    // Child LBs are shutdown which handles subchannel cleanup
 
     // A new LB stream is created
     assertEquals(1, fakeOobChannels.size());
@@ -2440,19 +2388,12 @@ public class GrpclbLoadBalancerTest {
     lbResponseObserver.onNext(buildInitialResponse());
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
-    // ROUND_ROBIN: create one subchannel per server
-    verify(subchannelPool).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends1.get(0).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
-    verify(subchannelPool).takeOrCreateSubchannel(
-        eq(new EquivalentAddressGroup(backends1.get(1).addr, LB_BACKEND_ATTRS)),
-        any(Attributes.class));
+    // ROUND_ROBIN: child pick_first LBs create subchannels via helper
     inOrder.verify(helper).updateBalancingState(eq(CONNECTING), any(SubchannelPicker.class));
     assertEquals(2, mockSubchannels.size());
     Subchannel subchannel1 = mockSubchannels.poll();
     Subchannel subchannel2 = mockSubchannels.poll();
-    verify(subchannelPool, never())
-        .returnSubchannel(any(Subchannel.class), any(ConnectivityStateInfo.class));
+    // Child LBs handle subchannel lifecycle
 
     // Switch to different serviceName
     serviceName = "bar.google.com";
@@ -2464,10 +2405,7 @@ public class GrpclbLoadBalancerTest {
 
     // GrpclbState will be shutdown, and a new one will be created
     assertThat(oobChannel.isShutdown()).isTrue();
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel1), eq(ConnectivityStateInfo.forNonError(IDLE)));
-    verify(subchannelPool)
-        .returnSubchannel(same(subchannel2), eq(ConnectivityStateInfo.forNonError(IDLE)));
+    // Child LBs are shutdown which handles subchannel cleanup
 
     assertEquals(1, fakeOobChannels.size());
     verify(mockLbService, times(2)).balanceLoad(lbResponseObserverCaptor.capture());
@@ -2481,7 +2419,7 @@ public class GrpclbLoadBalancerTest {
 
   @Test
   public void grpclbWorking_lbSendsFallbackMessage() {
-    InOrder inOrder = inOrder(helper, subchannelPool);
+    InOrder inOrder = inOrder(helper);
     List<EquivalentAddressGroup> backendList = createResolvedBackendAddresses(2);
     List<EquivalentAddressGroup> grpclbBalancerList = createResolvedBalancerAddresses(2);
     deliverResolvedAddresses(backendList, grpclbBalancerList);
@@ -2515,10 +2453,12 @@ public class GrpclbLoadBalancerTest {
     logs.clear();
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backend1a.addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backend1b.addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
 
@@ -2573,11 +2513,7 @@ public class GrpclbLoadBalancerTest {
     // Balancer forces entering fallback mode
     lbResponseObserver.onNext(buildLbFallbackResponse());
 
-    // existing subchannels must be returned immediately to gracefully shutdown.
-    verify(subchannelPool)
-        .returnSubchannel(eq(subchannel1), eq(ConnectivityStateInfo.forNonError(READY)));
-    verify(subchannelPool)
-        .returnSubchannel(eq(subchannel2), eq(ConnectivityStateInfo.forNonError(READY)));
+    // Child LBs are shutdown when entering fallback mode
 
     // verify fallback
     fallbackTestVerifyUseOfFallbackBackendLists(inOrder, backendList);
@@ -2591,9 +2527,7 @@ public class GrpclbLoadBalancerTest {
     deliverResolvedAddresses(Collections.<EquivalentAddressGroup>emptyList(), grpclbBalancerList);
 
     // Still in fallback logic, except that the backend list is empty
-    for (Subchannel subchannel : mockSubchannels) {
-      verify(subchannelPool).returnSubchannel(eq(subchannel), any(ConnectivityStateInfo.class));
-    }
+    // Child LBs handle subchannel lifecycle
 
     // RPC error status includes message of fallback requested by balancer
     inOrder.verify(helper).updateBalancingState(eq(TRANSIENT_FAILURE), pickerCaptor.capture());
@@ -2614,10 +2548,12 @@ public class GrpclbLoadBalancerTest {
     logs.clear();
     lbResponseObserver.onNext(buildLbResponse(backends2));
 
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backend2a.addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
-    inOrder.verify(subchannelPool).takeOrCreateSubchannel(
+    // Child pick_first LB creates subchannel via helper
+    inOrder.verify(helper).createSubchannel(
         eq(new EquivalentAddressGroup(backend2b.addr, LB_BACKEND_ATTRS)),
         any(Attributes.class));
 

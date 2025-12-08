@@ -64,7 +64,6 @@ public final class GrpclbLoadBalancerProvider extends LoadBalancerProvider {
         new GrpclbLoadBalancer(
             helper,
             Context.ROOT,
-            new CachedSubchannelPool(helper),
             TimeProvider.SYSTEM_TIME_PROVIDER,
             Stopwatch.createUnstarted(),
             new ExponentialBackoffPolicy.Provider());
