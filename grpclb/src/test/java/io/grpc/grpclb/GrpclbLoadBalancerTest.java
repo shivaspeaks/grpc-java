@@ -1941,7 +1941,7 @@ public class GrpclbLoadBalancerTest {
     RoundRobinPicker picker1 = (RoundRobinPicker) pickerCaptor.getValue();
     assertThat(picker1.dropList).containsExactly(null, null);
 
-    // New server list with drops - child LB is recreated (no updateAddresses)
+    // New server list with drops
     List<ServerEntry> backends2 = Arrays.asList(
         new ServerEntry("127.0.0.1", 2000, "token0001"),
         new ServerEntry("token0003"),  // drop
