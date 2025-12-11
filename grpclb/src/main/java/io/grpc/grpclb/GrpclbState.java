@@ -38,7 +38,6 @@ import io.grpc.ConnectivityStateInfo;
 import io.grpc.Context;
 import io.grpc.EquivalentAddressGroup;
 import io.grpc.LoadBalancer;
-import io.grpc.LoadBalancer.CreateSubchannelArgs;
 import io.grpc.LoadBalancer.FixedResultPicker;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.PickResult;
@@ -46,7 +45,6 @@ import io.grpc.LoadBalancer.PickSubchannelArgs;
 import io.grpc.LoadBalancer.ResolvedAddresses;
 import io.grpc.LoadBalancer.Subchannel;
 import io.grpc.LoadBalancer.SubchannelPicker;
-import io.grpc.LoadBalancer.SubchannelStateListener;
 import io.grpc.LoadBalancerProvider;
 import io.grpc.LoadBalancerRegistry;
 import io.grpc.ManagedChannel;
@@ -57,7 +55,6 @@ import io.grpc.SynchronizationContext.ScheduledHandle;
 import io.grpc.grpclb.SubchannelPool.PooledSubchannelStateListener;
 import io.grpc.internal.BackoffPolicy;
 import io.grpc.internal.TimeProvider;
-import io.grpc.util.ForwardingLoadBalancerHelper;
 import io.grpc.lb.v1.ClientStats;
 import io.grpc.lb.v1.InitialLoadBalanceRequest;
 import io.grpc.lb.v1.InitialLoadBalanceResponse;
@@ -68,6 +65,7 @@ import io.grpc.lb.v1.LoadBalancerGrpc;
 import io.grpc.lb.v1.Server;
 import io.grpc.lb.v1.ServerList;
 import io.grpc.stub.StreamObserver;
+import io.grpc.util.ForwardingLoadBalancerHelper;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
@@ -1166,7 +1164,8 @@ final class GrpclbState {
         return childResult;
       }
       // Wrap the pick result to attach tokens via the tracer factory.
-      return PickResult.withSubchannel(childResult.getSubchannel(), tracerFactory);
+      return PickResult.withSubchannel(
+          childResult.getSubchannel(), tracerFactory, childResult.getAuthorityOverride());
     }
 
     @Override
