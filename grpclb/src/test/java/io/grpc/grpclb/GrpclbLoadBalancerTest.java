@@ -1948,10 +1948,9 @@ public class GrpclbLoadBalancerTest {
         new ServerEntry("127.0.0.1", 2020, "token0004"));
     lbResponseObserver.onNext(buildLbResponse(backends2));
 
-    // With delegation, child LB is recreated so a new subchannel is created.
-    // No updateAddresses() call - this is the key behavioral change.
-    verify(subchannel, never()).updateAddresses(any());
-    verify(helper, atLeast(2)).createSubchannel(any(CreateSubchannelArgs.class));
+    // the child LB is not recreated. A single subchannel is created
+    // for the lifetime of the test. The child LB will internally call updateAddresses.
+    verify(helper, times(1)).createSubchannel(any(CreateSubchannelArgs.class));
 
     // Verify drop list is updated after new child LB updates state
     verify(helper, atLeast(1)).updateBalancingState(any(), pickerCaptor.capture());
@@ -2117,10 +2116,10 @@ public class GrpclbLoadBalancerTest {
     lbResponseObserver.onNext(buildInitialResponse());
     lbResponseObserver.onNext(buildLbResponse(backends1));
 
-    // With delegation, child LB is recreated (no updateAddresses)
-    verify(subchannel, never()).updateAddresses(any());
-    // New subchannel is created for LB-provided backends
-    verify(helper, atLeast(2)).createSubchannel(any(CreateSubchannelArgs.class));
+    // the same child LB is updated with new addresses. We expect
+    // only one subchannel to be created for the whole test. The child LB will call
+    // updateAddresses() internally, so we remove the verifications for recreation.
+    verify(helper, times(1)).createSubchannel(any(CreateSubchannelArgs.class));
 
     // PICK_FIRST doesn't use subchannelPool
     verify(subchannelPool, never())

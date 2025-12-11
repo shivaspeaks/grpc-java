@@ -568,16 +568,11 @@ final class GrpclbState {
           }
           eagList.add(new EquivalentAddressGroup(origEag.getAddresses(), eagAttrs));
         }
-        // Always shutdown and recreate the child LB when addresses change to avoid
-        // calling Subchannel.updateAddresses(). This ensures we use the new dualstack-
-        // compatible path where the child LB creates fresh subchannels.
-        if (pickFirstLb != null) {
-          pickFirstLb.shutdown();
+
+        if (pickFirstLb == null) {
+          pickFirstLb = pickFirstLbProvider.newLoadBalancer(new PickFirstLbHelper());
         }
-        pickFirstLb = pickFirstLbProvider.newLoadBalancer(new PickFirstLbHelper());
-        // Reset the child LB state, since we created a new one.
-        pickFirstLbState = CONNECTING;
-        pickFirstLbPicker = new FixedResultPicker(PickResult.withNoResult());
+
         // Pass addresses to child LB.
         pickFirstLb.acceptResolvedAddresses(
             ResolvedAddresses.newBuilder()
