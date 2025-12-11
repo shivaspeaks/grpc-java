@@ -225,8 +225,9 @@ final class GrpclbState {
     } else {
       this.subchannelPool = null;
     }
-    this.pickFirstLbProvider =
-        LoadBalancerRegistry.getDefaultRegistry().getProvider("pick_first");
+    this.pickFirstLbProvider = checkNotNull(
+        LoadBalancerRegistry.getDefaultRegistry().getProvider("pick_first"),
+        "pick_first balancer not available");
     this.time = checkNotNull(time, "time provider");
     this.stopwatch = checkNotNull(stopwatch, "stopwatch");
     this.timerService = checkNotNull(helper.getScheduledExecutorService(), "timerService");
@@ -574,6 +575,9 @@ final class GrpclbState {
           pickFirstLb.shutdown();
         }
         pickFirstLb = pickFirstLbProvider.newLoadBalancer(new PickFirstLbHelper());
+        // Reset the child LB state, since we created a new one.
+        pickFirstLbState = CONNECTING;
+        pickFirstLbPicker = new FixedResultPicker(PickResult.withNoResult());
         // Pass addresses to child LB.
         pickFirstLb.acceptResolvedAddresses(
             ResolvedAddresses.newBuilder()
