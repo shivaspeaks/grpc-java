@@ -28,6 +28,7 @@ import io.grpc.LoadBalancer;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.SynchronizationContext.ScheduledHandle;
+import io.grpc.internal.GrpcUtil;
 import io.grpc.util.ForwardingLoadBalancerHelper;
 import io.grpc.util.GracefulSwitchLoadBalancer;
 import io.grpc.xds.PriorityLoadBalancerProvider.PriorityLbConfig;
@@ -98,7 +99,12 @@ final class PriorityLoadBalancer extends LoadBalancer {
       if (!prioritySet.contains(priority)) {
         ChildLbState childLbState = children.get(priority);
         if (childLbState != null) {
-          childLbState.deactivate();
+          if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_ENABLE_PRIORITY_LB_CHILD_POLICY_CACHE", false)) {
+            childLbState.deactivate();
+          } else {
+            children.remove(priority);
+            childLbState.tearDown();
+          }
         }
       }
     }
