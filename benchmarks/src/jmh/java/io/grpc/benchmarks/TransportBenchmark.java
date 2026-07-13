@@ -69,13 +69,13 @@ public class TransportBenchmark {
     INPROCESS, NETTY, NETTY_LOCAL, NETTY_EPOLL, OKHTTP
   }
 
-  @Param({"INPROCESS", "NETTY", "OKHTTP"})
+  @Param({"NETTY"})
   public Transport transport;
   @Param({"true", "false"})
   public boolean direct;
 
   private ManagedChannel channel;
-  private Server server;
+  private Server server; 
   private BenchmarkServiceGrpc.BenchmarkServiceBlockingStub stub;
   private BenchmarkServiceGrpc.BenchmarkServiceStub asyncStub;
   private EventLoopGroup groupToShutdown;
@@ -194,7 +194,7 @@ public class TransportBenchmark {
       .setPayload(Payload.newBuilder().setBody(ByteString.copyFrom(new byte[1024])))
       .build();
 
-  @Benchmark
+  // @Benchmark
   @BenchmarkMode(Mode.SampleTime)
   @OutputTimeUnit(TimeUnit.NANOSECONDS)
   public SimpleResponse unaryCall1024Latency() {
@@ -315,7 +315,7 @@ public class TransportBenchmark {
 
   // NOTE: Causes OOM with NETTY_LOCAL. Probably a flow control problem in NETTY_LOCAL, but we
   // aren't too concerned.
-  @Benchmark
+  // @Benchmark
   @BenchmarkMode(Mode.Throughput)
   @Threads(10)
   public SimpleResponse streamingCallsMessageThroughput(InfiniteStreamState state)
