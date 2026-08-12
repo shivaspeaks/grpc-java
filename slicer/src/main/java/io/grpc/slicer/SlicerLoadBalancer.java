@@ -35,9 +35,10 @@ import io.grpc.SynchronizationContext;
 import io.grpc.slicer.SliceMap.SliceEntry;
 import io.grpc.slicer.SlicerLoadBalancerProvider.SlicerConfig;
 import io.grpc.util.ForwardingLoadBalancerHelper;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -151,20 +152,33 @@ public final class SlicerLoadBalancer extends LoadBalancer {
       return Status.OK;
     }
 
-    Set<String> newHostnames = new HashSet<>();
-    for (int i = 0; i < addresses.size(); i++) {
-      EquivalentAddressGroup eag = addresses.get(i);
+    // Group addresses by hostname
+    Map<String, List<EquivalentAddressGroup>> groupedByHostname = new LinkedHashMap<>();
+    for (EquivalentAddressGroup eag : addresses) {
       String hostname = getHostname(eag);
-      newHostnames.add(hostname);
+      List<EquivalentAddressGroup> eags = groupedByHostname.get(hostname);
+      if (eags == null) {
+        eags = new ArrayList<>();
+        groupedByHostname.put(hostname, eags);
+      }
+      eags.add(eag);
+    }
+
+    Set<String> newHostnames = groupedByHostname.keySet();
+    int index = 0;
+    for (Map.Entry<String, List<EquivalentAddressGroup>> entry : groupedByHostname.entrySet()) {
+      String hostname = entry.getKey();
+      List<EquivalentAddressGroup> eags = entry.getValue();
 
       EndpointHolder holder = endpointMap.get(hostname);
       if (holder == null) {
-        holder = new EndpointHolder(i);
+        holder = new EndpointHolder(index);
         endpointMap.put(hostname, holder);
       } else {
-        holder.index = i;
+        holder.index = index;
       }
-      holder.updateAddress(eag, resolvedAddresses.getAttributes());
+      holder.updateAddresses(eags, resolvedAddresses.getAttributes());
+      index++;
     }
 
     // Remove obsolete endpoints
@@ -417,7 +431,11 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     if (hostname != null && !hostname.isEmpty()) {
       return hostname;
     }
-    return eag.getAddresses().get(0).toString();
+    SocketAddress address = eag.getAddresses().get(0);
+    if (address instanceof InetSocketAddress) {
+      return ((InetSocketAddress) address).getHostString();
+    }
+    return address.toString();
   }
 
   private final class ShardingCallback implements ShardingClient.Callback {
@@ -440,12 +458,6 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     @Override
     public void onError(Throwable t) {
       logger.log(Level.WARNING, "ShardingClient stream error", t);
-      // Keep using existing slice map if we have one.
-      // If we don't have one and timer already expired, rebuild fallback.
-      if (currentSliceMap == null && fallbackTimerFired) {
-        rebuildSliceMap();
-        updateAggregatedState();
-      }
     }
   }
 
@@ -460,9 +472,9 @@ public final class SlicerLoadBalancer extends LoadBalancer {
       this.childLb = new LazyChildLoadBalancer(new ChildHelper(), pickFirstProvider);
     }
 
-    void updateAddress(EquivalentAddressGroup eag, Attributes attributes) {
+    void updateAddresses(List<EquivalentAddressGroup> eags, Attributes attributes) {
       ResolvedAddresses childAddresses = ResolvedAddresses.newBuilder()
-          .setAddresses(Collections.singletonList(eag))
+          .setAddresses(eags)
           .setAttributes(attributes)
           .build();
       childLb.acceptResolvedAddresses(childAddresses);
