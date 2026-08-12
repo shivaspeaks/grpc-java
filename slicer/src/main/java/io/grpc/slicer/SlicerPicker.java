@@ -17,12 +17,12 @@
 package io.grpc.slicer;
 
 import io.grpc.ConnectivityState;
+import io.grpc.InternalMetadata;
 import io.grpc.LoadBalancer.PickResult;
 import io.grpc.LoadBalancer.PickSubchannelArgs;
 import io.grpc.LoadBalancer.SubchannelPicker;
 import io.grpc.Metadata;
 import io.grpc.Status;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -31,12 +31,24 @@ import java.util.concurrent.ThreadLocalRandom;
 final class SlicerPicker extends SubchannelPicker {
   private static final byte[] EMPTY_BYTES = new byte[0];
 
+  private static final InternalMetadata.TrustedAsciiMarshaller<byte[]> RAW_ASCII_MARSHALLER =
+      new InternalMetadata.TrustedAsciiMarshaller<byte[]>() {
+        @Override
+        public byte[] toAsciiString(byte[] value) {
+          return value;
+        }
+
+        @Override
+        public byte[] parseAsciiString(byte[] serialized) {
+          return serialized;
+        }
+      };
+
   private final SliceMap sliceMap;
   private final List<PickerEndpoint> endpoints;
   private final boolean[] sliceInFallback;
   private final boolean fallbackEnabled;
-  private final Metadata.Key<byte[]> binaryKey;
-  private final Metadata.Key<String> stringKey;
+  private final Metadata.Key<byte[]> sliceKeyHeader;
 
   SlicerPicker(
       SliceMap sliceMap,
@@ -48,14 +60,11 @@ final class SlicerPicker extends SubchannelPicker {
     this.fallbackEnabled = fallbackEnabled;
 
     if (sliceKeyHeaderName == null || sliceKeyHeaderName.isEmpty()) {
-      this.binaryKey = null;
-      this.stringKey = null;
+      this.sliceKeyHeader = null;
     } else if (sliceKeyHeaderName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-      this.binaryKey = Metadata.Key.of(sliceKeyHeaderName, Metadata.BINARY_BYTE_MARSHALLER);
-      this.stringKey = null;
+      this.sliceKeyHeader = Metadata.Key.of(sliceKeyHeaderName, Metadata.BINARY_BYTE_MARSHALLER);
     } else {
-      this.binaryKey = null;
-      this.stringKey = Metadata.Key.of(sliceKeyHeaderName, Metadata.ASCII_STRING_MARSHALLER);
+      this.sliceKeyHeader = InternalMetadata.keyOf(sliceKeyHeaderName, RAW_ASCII_MARSHALLER);
     }
 
     this.sliceInFallback = new boolean[sliceMap.getSlices().size()];
@@ -138,13 +147,9 @@ final class SlicerPicker extends SubchannelPicker {
   }
 
   private byte[] extractKeyBytes(Metadata headers) {
-    if (binaryKey != null) {
-      byte[] val = headers.get(binaryKey);
+    if (sliceKeyHeader != null) {
+      byte[] val = headers.get(sliceKeyHeader);
       return val != null ? val : EMPTY_BYTES;
-    }
-    if (stringKey != null) {
-      String val = headers.get(stringKey);
-      return val != null ? val.getBytes(StandardCharsets.UTF_8) : EMPTY_BYTES;
     }
     return EMPTY_BYTES;
   }
