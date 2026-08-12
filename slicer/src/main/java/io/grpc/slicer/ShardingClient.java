@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 The gRPC Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.grpc.slicer;
 
 import com.google.cloud.autosharding.v1main.AssignmentChunk;
@@ -30,7 +46,11 @@ final class ShardingClient {
   private static final Logger logger = Logger.getLogger(ShardingClient.class.getName());
 
   interface Callback {
-    void onAssignmentReceived(List<SliceAssignment> sliceAssignments, List<EndpointState> endpoints, long generation);
+    void onAssignmentReceived(
+        List<SliceAssignment> sliceAssignments,
+        List<EndpointState> endpoints,
+        long generation);
+
     void onError(Throwable t);
   }
 
@@ -99,23 +119,24 @@ final class ShardingClient {
       DynamicShardingServiceGrpc.DynamicShardingServiceStub stub =
           DynamicShardingServiceGrpc.newStub(channel).withWaitForReady();
 
-      requestStream = stub.watchShardingAssignment(new StreamObserver<WatchShardingAssignmentResponse>() {
-        @Override
-        public void onNext(WatchShardingAssignmentResponse response) {
-          syncContext.execute(() -> handleResponse(response));
-        }
+      requestStream = stub.watchShardingAssignment(
+          new StreamObserver<WatchShardingAssignmentResponse>() {
+            @Override
+            public void onNext(WatchShardingAssignmentResponse response) {
+              syncContext.execute(() -> handleResponse(response));
+            }
 
-        @Override
-        public void onError(Throwable t) {
-          syncContext.execute(() -> handleError(t));
-        }
+            @Override
+            public void onError(Throwable t) {
+              syncContext.execute(() -> handleError(t));
+            }
 
-        @Override
-        public void onCompleted() {
-          syncContext.execute(() -> handleError(
-              Status.UNAVAILABLE.withDescription("Server closed stream").asRuntimeException()));
-        }
-      });
+            @Override
+            public void onCompleted() {
+              syncContext.execute(() -> handleError(
+                  Status.UNAVAILABLE.withDescription("Server closed stream").asRuntimeException()));
+            }
+          });
 
       InitialClientConfig initConfig = InitialClientConfig.newBuilder()
           .setTarget(target)
@@ -141,9 +162,11 @@ final class ShardingClient {
 
       // Validate assignment per gRFC A119
       if (!validateAssignment(assembledSlices, assembledEndpoints)) {
-        logger.log(Level.WARNING, "Assignment validation failed. Terminating stream to reconnect.");
+        logger.log(
+            Level.WARNING, "Assignment validation failed. Terminating stream to reconnect.");
         handleError(
-            Status.INTERNAL.withDescription("Assignment validation failed: invalid key ranges or endpoint indices")
+            Status.INTERNAL.withDescription(
+                "Assignment validation failed: invalid key ranges or endpoint indices")
                 .asRuntimeException());
         return;
       }

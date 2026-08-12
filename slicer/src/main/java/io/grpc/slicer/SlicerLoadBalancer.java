@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 The gRPC Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.grpc.slicer;
 
 import static io.grpc.ConnectivityState.CONNECTING;
@@ -14,7 +30,6 @@ import io.grpc.EquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancerProvider;
 import io.grpc.LoadBalancerRegistry;
-import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.slicer.SliceMap.SliceEntry;
@@ -35,7 +50,28 @@ public final class SlicerLoadBalancer extends LoadBalancer {
   private static final Logger logger = Logger.getLogger(SlicerLoadBalancer.class.getName());
 
   public interface ChannelFactory {
-    Channel createChannel(String target);
+    final class ChannelHolder implements AutoCloseable {
+      private final Channel channel;
+      private final Runnable releaseCallback;
+
+      public ChannelHolder(Channel channel, Runnable releaseCallback) {
+        this.channel = channel;
+        this.releaseCallback = releaseCallback;
+      }
+
+      public Channel getChannel() {
+        return channel;
+      }
+
+      @Override
+      public void close() {
+        if (releaseCallback != null) {
+          releaseCallback.run();
+        }
+      }
+    }
+
+    ChannelHolder createChannel(String target);
   }
 
   public static final Attributes.Key<ChannelFactory> CHANNEL_FACTORY_KEY =
@@ -48,6 +84,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
   private final SynchronizationContext syncContext;
   private final LoadBalancerProvider pickFirstProvider;
 
+  private ChannelFactory.ChannelHolder shardingChannelHolder;
   private Channel shardingChannel;
   private ShardingClient shardingClient;
   private String currentChannelFactoryKey;
@@ -92,16 +129,25 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     if (shardingClient == null
         || !config.channelFactoryKey.equals(currentChannelFactoryKey)
         || !config.slicingTarget.equals(currentSlicingTarget)) {
-      initShardingClient(resolvedAddresses.getAttributes(), config.channelFactoryKey, config.slicingTarget);
+      initShardingClient(
+          resolvedAddresses.getAttributes(),
+          config.channelFactoryKey,
+          config.slicingTarget);
     }
 
     // Process endpoints from Name Resolver
     List<EquivalentAddressGroup> addresses = resolvedAddresses.getAddresses();
     if (addresses.isEmpty()) {
+      for (EndpointHolder holder : endpointMap.values()) {
+        holder.shutdown();
+      }
+      endpointMap.clear();
+      currentSliceMap = null;
       helper.updateBalancingState(
           TRANSIENT_FAILURE,
           new FixedResultPicker(PickResult.withError(
-              Status.UNAVAILABLE.withDescription("NameResolver returned empty list of endpoints"))));
+              Status.UNAVAILABLE.withDescription(
+                  "NameResolver returned empty list of endpoints"))));
       return Status.OK;
     }
 
@@ -118,7 +164,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
       } else {
         holder.index = i;
       }
-      holder.updateAddress(eag);
+      holder.updateAddress(eag, resolvedAddresses.getAttributes());
     }
 
     // Remove obsolete endpoints
@@ -154,14 +200,13 @@ public final class SlicerLoadBalancer extends LoadBalancer {
       shardingClient.stop();
       shardingClient = null;
     }
-    if (shardingChannel instanceof ManagedChannel) {
-      ((ManagedChannel) shardingChannel).shutdown();
-    } else if (shardingChannel instanceof AutoCloseable) {
+    if (shardingChannelHolder != null) {
       try {
-        ((AutoCloseable) shardingChannel).close();
+        shardingChannelHolder.close();
       } catch (Exception e) {
         logger.log(Level.WARNING, "Error closing sharding channel", e);
       }
+      shardingChannelHolder = null;
     }
     shardingChannel = null;
   }
@@ -189,7 +234,15 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     }
     String actualTarget = slicingTarget.replace("%s", locality);
 
-    shardingChannel = factory.createChannel(channelFactoryKey);
+    shardingChannelHolder = factory.createChannel(channelFactoryKey);
+    if (shardingChannelHolder == null || shardingChannelHolder.getChannel() == null) {
+      logger.log(
+          Level.WARNING,
+          "ChannelFactory returned null channel for target {0}",
+          channelFactoryKey);
+      return;
+    }
+    shardingChannel = shardingChannelHolder.getChannel();
     shardingClient =
         new ShardingClient(
             shardingChannel,
@@ -221,6 +274,11 @@ public final class SlicerLoadBalancer extends LoadBalancer {
   }
 
   private void rebuildSliceMap() {
+    if (endpointMap.isEmpty()) {
+      currentSliceMap = null;
+      return;
+    }
+
     // Populate fallback_pool deterministically sorted by endpoint index
     List<Integer> fallbackPool = new ArrayList<>();
     for (int i = 0; i < endpointMap.size(); i++) {
@@ -255,6 +313,15 @@ public final class SlicerLoadBalancer extends LoadBalancer {
   }
 
   private void updateAggregatedState() {
+    if (endpointMap.isEmpty()) {
+      helper.updateBalancingState(
+          TRANSIENT_FAILURE,
+          new FixedResultPicker(PickResult.withError(
+              Status.UNAVAILABLE.withDescription(
+                  "NameResolver returned empty list of endpoints"))));
+      return;
+    }
+
     int readyCount = 0;
     int tfCount = 0;
     int connectingCount = 0;
@@ -304,11 +371,18 @@ public final class SlicerLoadBalancer extends LoadBalancer {
 
     SubchannelPicker picker;
     if (currentSliceMap != null) {
-      List<PickerEndpoint> pickerEndpoints = new ArrayList<>(Collections.nCopies(endpointMap.size(), null));
+      List<PickerEndpoint> pickerEndpoints =
+          new ArrayList<>(Collections.nCopies(endpointMap.size(), null));
       for (EndpointHolder holder : endpointMap.values()) {
-        pickerEndpoints.set(holder.index, new PickerEndpoint(holder.state, holder.picker, holder::requestConnection));
+        pickerEndpoints.set(
+            holder.index,
+            new PickerEndpoint(
+                holder.state,
+                holder.picker,
+                () -> syncContext.execute(holder::requestConnection)));
       }
-      picker = new SlicerPicker(currentSliceMap, pickerEndpoints, fallbackEnabled, sliceKeyHeaderName);
+      picker = new SlicerPicker(
+          currentSliceMap, pickerEndpoints, fallbackEnabled, sliceKeyHeaderName);
     } else {
       picker = new FixedResultPicker(
           PickResult.withNoResult(
@@ -386,10 +460,10 @@ public final class SlicerLoadBalancer extends LoadBalancer {
       this.childLb = new LazyChildLoadBalancer(new ChildHelper(), pickFirstProvider);
     }
 
-    void updateAddress(EquivalentAddressGroup eag) {
+    void updateAddress(EquivalentAddressGroup eag, Attributes attributes) {
       ResolvedAddresses childAddresses = ResolvedAddresses.newBuilder()
           .setAddresses(Collections.singletonList(eag))
-          .setAttributes(Attributes.EMPTY)
+          .setAttributes(attributes)
           .build();
       childLb.acceptResolvedAddresses(childAddresses);
     }

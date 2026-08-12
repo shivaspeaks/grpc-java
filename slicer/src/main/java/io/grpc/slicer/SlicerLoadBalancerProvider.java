@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 The gRPC Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.grpc.slicer;
 
 import com.google.common.base.MoreObjects;
@@ -5,10 +21,10 @@ import io.grpc.Internal;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancerProvider;
 import io.grpc.NameResolver.ConfigOrError;
+import io.grpc.Status;
 import io.grpc.internal.JsonUtil;
 import java.util.Map;
 import java.util.Objects;
-import javax.annotation.Nullable;
 
 @Internal
 public final class SlicerLoadBalancerProvider extends LoadBalancerProvider {
@@ -35,33 +51,55 @@ public final class SlicerLoadBalancerProvider extends LoadBalancerProvider {
   }
 
   @Override
-  public ConfigOrError parseLoadBalancingPolicyConfig(Map<String, ?> rawLoadBalancingPolicyConfig) {
+  public ConfigOrError parseLoadBalancingPolicyConfig(
+      Map<String, ?> rawLoadBalancingPolicyConfig) {
     try {
-      return ConfigOrError.fromConfig(parseConfig(rawLoadBalancingPolicyConfig));
+      String channelFactoryKey =
+          JsonUtil.getString(rawLoadBalancingPolicyConfig, "channelFactoryKey");
+      if (channelFactoryKey == null || channelFactoryKey.isEmpty()) {
+        return ConfigOrError.fromError(
+            Status.INVALID_ARGUMENT.withDescription(
+                "Missing required field 'channelFactoryKey' in autosharding config"));
+      }
+
+      String slicingTarget =
+          JsonUtil.getString(rawLoadBalancingPolicyConfig, "slicingTarget");
+      if (slicingTarget == null || slicingTarget.isEmpty()) {
+        return ConfigOrError.fromError(
+            Status.INVALID_ARGUMENT.withDescription(
+                "Missing required field 'slicingTarget' in autosharding config"));
+      }
+
+      String sliceKeyHeaderName =
+          JsonUtil.getString(rawLoadBalancingPolicyConfig, "sliceKeyHeaderName");
+      if (sliceKeyHeaderName == null || sliceKeyHeaderName.isEmpty()) {
+        return ConfigOrError.fromError(
+            Status.INVALID_ARGUMENT.withDescription(
+                "Missing required field 'sliceKeyHeaderName' in autosharding config"));
+      }
+
+      Boolean enableFallback =
+          JsonUtil.getBoolean(rawLoadBalancingPolicyConfig, "enableFallback");
+      if (enableFallback == null) {
+        enableFallback = false;
+      }
+
+      Long initialAssignmentTimeoutNanos =
+          JsonUtil.getStringAsDuration(
+              rawLoadBalancingPolicyConfig, "initialAssignmentTimeout");
+
+      return ConfigOrError.fromConfig(
+          new SlicerConfig(
+              channelFactoryKey,
+              slicingTarget,
+              sliceKeyHeaderName,
+              enableFallback,
+              initialAssignmentTimeoutNanos));
     } catch (RuntimeException e) {
       return ConfigOrError.fromError(
-          io.grpc.Status.UNKNOWN.withDescription("Failed to parse config: " + e.getMessage()).withCause(e));
+          Status.INVALID_ARGUMENT.withDescription(
+              "Failed to parse autosharding config: " + e.getMessage()).withCause(e));
     }
-  }
-
-  private SlicerConfig parseConfig(Map<String, ?> config) {
-    String channelFactoryKey = JsonUtil.getString(config, "channelFactoryKey");
-    String slicingTarget = JsonUtil.getString(config, "slicingTarget");
-    String sliceKeyHeaderName = JsonUtil.getString(config, "sliceKeyHeaderName");
-    Boolean enableFallback = JsonUtil.getBoolean(config, "enableFallback");
-    // Default is 60 seconds if not provided.
-    Long initialAssignmentTimeoutNanos = JsonUtil.getStringAsDuration(config, "initialAssignmentTimeout");
-    
-    if (enableFallback == null) {
-      enableFallback = false;
-    }
-    
-    return new SlicerConfig(
-        channelFactoryKey, 
-        slicingTarget, 
-        sliceKeyHeaderName, 
-        enableFallback, 
-        initialAssignmentTimeoutNanos);
   }
 
   public static final class SlicerConfig {
@@ -102,7 +140,12 @@ public final class SlicerLoadBalancerProvider extends LoadBalancerProvider {
 
     @Override
     public int hashCode() {
-      return Objects.hash(channelFactoryKey, slicingTarget, sliceKeyHeaderName, enableFallback, initialAssignmentTimeoutNanos);
+      return Objects.hash(
+          channelFactoryKey,
+          slicingTarget,
+          sliceKeyHeaderName,
+          enableFallback,
+          initialAssignmentTimeoutNanos);
     }
 
     @Override
