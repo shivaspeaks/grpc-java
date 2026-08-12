@@ -14,6 +14,7 @@ import io.grpc.EquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancerProvider;
 import io.grpc.LoadBalancerRegistry;
+import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.slicer.SliceMap.SliceEntry;
@@ -148,12 +149,26 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     return Status.OK;
   }
 
-  private void initShardingClient(
-      Attributes attributes, String channelFactoryKey, String slicingTarget) {
+  private void closeShardingChannel() {
     if (shardingClient != null) {
       shardingClient.stop();
       shardingClient = null;
     }
+    if (shardingChannel instanceof ManagedChannel) {
+      ((ManagedChannel) shardingChannel).shutdown();
+    } else if (shardingChannel instanceof AutoCloseable) {
+      try {
+        ((AutoCloseable) shardingChannel).close();
+      } catch (Exception e) {
+        logger.log(Level.WARNING, "Error closing sharding channel", e);
+      }
+    }
+    shardingChannel = null;
+  }
+
+  private void initShardingClient(
+      Attributes attributes, String channelFactoryKey, String slicingTarget) {
+    closeShardingChannel();
     if (fallbackTimer != null) {
       fallbackTimer.cancel();
       fallbackTimer = null;
@@ -231,7 +246,9 @@ public final class SlicerLoadBalancer extends LoadBalancer {
           }
         }
       }
-      sliceEntries.add(new SliceEntry(protoSlice.getSlice().getStartKeyInclusive(), sliceEndpoints));
+      sliceEntries.add(
+          new SliceEntry(
+              protoSlice.getSlice().getStartKeyInclusive().toByteArray(), sliceEndpoints));
     }
 
     currentSliceMap = new SliceMap(sliceEntries, fallbackPool, latestGeneration);
@@ -310,10 +327,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
 
   @Override
   public void shutdown() {
-    if (shardingClient != null) {
-      shardingClient.stop();
-      shardingClient = null;
-    }
+    closeShardingChannel();
     if (fallbackTimer != null) {
       fallbackTimer.cancel();
       fallbackTimer = null;

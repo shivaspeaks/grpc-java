@@ -11,6 +11,8 @@ import com.google.cloud.autosharding.v1main.WatchShardingAssignmentRequest;
 import com.google.cloud.autosharding.v1main.WatchShardingAssignmentResponse;
 import com.google.protobuf.ByteString;
 import io.grpc.Channel;
+import io.grpc.Context;
+import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.BackoffPolicy;
 import io.grpc.internal.ExponentialBackoffPolicy;
@@ -40,6 +42,7 @@ final class ShardingClient {
   private final BackoffPolicy.Provider backoffPolicyProvider;
   private final Callback callback;
 
+  private Context.CancellableContext cancellableContext;
   private StreamObserver<WatchShardingAssignmentRequest> requestStream;
   private long currentGeneration = 0;
   private BackoffPolicy backoffPolicy;
@@ -89,33 +92,39 @@ final class ShardingClient {
     if (stopped) {
       return;
     }
-    DynamicShardingServiceGrpc.DynamicShardingServiceStub stub =
-        DynamicShardingServiceGrpc.newStub(channel).withWaitForReady();
-    
-    requestStream = stub.watchShardingAssignment(new StreamObserver<WatchShardingAssignmentResponse>() {
-      @Override
-      public void onNext(WatchShardingAssignmentResponse response) {
-        syncContext.execute(() -> handleResponse(response));
-      }
+    closeStream();
 
-      @Override
-      public void onError(Throwable t) {
-        syncContext.execute(() -> handleError(t));
-      }
+    cancellableContext = Context.current().withCancellation();
+    cancellableContext.run(() -> {
+      DynamicShardingServiceGrpc.DynamicShardingServiceStub stub =
+          DynamicShardingServiceGrpc.newStub(channel).withWaitForReady();
 
-      @Override
-      public void onCompleted() {
-        syncContext.execute(() -> handleError(new RuntimeException("Server closed stream")));
-      }
+      requestStream = stub.watchShardingAssignment(new StreamObserver<WatchShardingAssignmentResponse>() {
+        @Override
+        public void onNext(WatchShardingAssignmentResponse response) {
+          syncContext.execute(() -> handleResponse(response));
+        }
+
+        @Override
+        public void onError(Throwable t) {
+          syncContext.execute(() -> handleError(t));
+        }
+
+        @Override
+        public void onCompleted() {
+          syncContext.execute(() -> handleError(
+              Status.UNAVAILABLE.withDescription("Server closed stream").asRuntimeException()));
+        }
+      });
+
+      InitialClientConfig initConfig = InitialClientConfig.newBuilder()
+          .setTarget(target)
+          .setClientUuid(clientUuid)
+          .setCurrentGeneration(currentGeneration)
+          .build();
+
+      requestStream.onNext(WatchShardingAssignmentRequest.newBuilder().setInit(initConfig).build());
     });
-
-    InitialClientConfig initConfig = InitialClientConfig.newBuilder()
-        .setTarget(target)
-        .setClientUuid(clientUuid)
-        .setCurrentGeneration(currentGeneration)
-        .build();
-
-    requestStream.onNext(WatchShardingAssignmentRequest.newBuilder().setInit(initConfig).build());
   }
 
   private void handleResponse(WatchShardingAssignmentResponse response) {
@@ -133,7 +142,9 @@ final class ShardingClient {
       // Validate assignment per gRFC A119
       if (!validateAssignment(assembledSlices, assembledEndpoints)) {
         logger.log(Level.WARNING, "Assignment validation failed. Terminating stream to reconnect.");
-        handleError(new IllegalArgumentException("Assignment validation failed: invalid key ranges or endpoint indices"));
+        handleError(
+            Status.INTERNAL.withDescription("Assignment validation failed: invalid key ranges or endpoint indices")
+                .asRuntimeException());
         return;
       }
 
@@ -152,6 +163,9 @@ final class ShardingClient {
 
   private static boolean validateAssignment(
       List<SliceAssignment> slices, List<EndpointState> endpoints) {
+    if (slices.isEmpty()) {
+      return false;
+    }
     int totalEndpoints = endpoints.size();
 
     // 1. Ensure all endpoint indices are valid
@@ -164,52 +178,52 @@ final class ShardingClient {
       }
     }
 
-    // 2. Ensure no gaps in key ranges and covers full range
-    if (!slices.isEmpty()) {
-      List<SliceAssignment> sorted = new ArrayList<>(slices);
-      sorted.sort(
-          Comparator.comparing(
-              sa -> sa.getSlice().getStartKeyInclusive(),
-              ByteString.unsignedLexicographicalComparator()));
+    // 2. Ensure no gaps in key ranges and covers full range ["" .. ""]
+    List<SliceAssignment> sorted = new ArrayList<>(slices);
+    sorted.sort(
+        Comparator.comparing(
+            sa -> sa.getSlice().getStartKeyInclusive(),
+            ByteString.unsignedLexicographicalComparator()));
 
-      // First slice must start at empty ByteString (start of keyspace)
-      if (!sorted.get(0).getSlice().getStartKeyInclusive().isEmpty()) {
+    // First slice must start at empty ByteString (start of keyspace)
+    if (!sorted.get(0).getSlice().getStartKeyInclusive().isEmpty()) {
+      return false;
+    }
+
+    for (int i = 0; i < sorted.size() - 1; i++) {
+      ByteString currentEnd = sorted.get(i).getSlice().getEndKeyExclusive();
+      ByteString nextStart = sorted.get(i + 1).getSlice().getStartKeyInclusive();
+      // If end_key is unset (empty), this slice extends to the largest allowed key.
+      // It cannot have subsequent slices.
+      if (currentEnd.isEmpty()) {
         return false;
       }
-
-      for (int i = 0; i < sorted.size() - 1; i++) {
-        ByteString currentEnd = sorted.get(i).getSlice().getEndKeyExclusive();
-        ByteString nextStart = sorted.get(i + 1).getSlice().getStartKeyInclusive();
-        // If end_key is unset (empty), this slice extends to the largest allowed key.
-        // It cannot have subsequent slices.
-        if (currentEnd.isEmpty()) {
-          return false;
-        }
-        if (!currentEnd.equals(nextStart)) {
-          return false; // Gap or overlap
-        }
+      if (!currentEnd.equals(nextStart)) {
+        return false; // Gap or overlap
       }
+    }
 
-      // Last slice's end_key must be empty (sentinel indicating end of keyspace)
-      if (!sorted.get(sorted.size() - 1).getSlice().getEndKeyExclusive().isEmpty()) {
-        return false;
-      }
+    // Last slice's end_key must be empty (sentinel indicating end of keyspace)
+    if (!sorted.get(sorted.size() - 1).getSlice().getEndKeyExclusive().isEmpty()) {
+      return false;
     }
 
     return true;
   }
 
+  private void closeStream() {
+    if (cancellableContext != null) {
+      cancellableContext.cancel(
+          Status.CANCELLED.withDescription("Stream closed by client").asRuntimeException());
+      cancellableContext = null;
+    }
+    requestStream = null;
+  }
+
   private void handleError(Throwable t) {
     currentSliceAssignments.clear();
     currentEndpoints.clear();
-    if (requestStream != null) {
-      try {
-        requestStream.onError(t);
-      } catch (Exception e) {
-        logger.log(Level.FINE, "Error while closing request stream", e);
-      }
-      requestStream = null;
-    }
+    closeStream();
     callback.onError(t);
     if (!stopped) {
       scheduleReconnect();
@@ -239,13 +253,6 @@ final class ShardingClient {
       retryTimer.cancel();
       retryTimer = null;
     }
-    if (requestStream != null) {
-      try {
-        requestStream.onError(new RuntimeException("Client shutting down"));
-      } catch (Exception e) {
-        logger.log(Level.FINE, "Error while shutting down request stream", e);
-      }
-      requestStream = null;
-    }
+    closeStream();
   }
 }

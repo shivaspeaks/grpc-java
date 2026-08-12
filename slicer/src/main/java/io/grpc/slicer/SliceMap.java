@@ -1,23 +1,23 @@
 package io.grpc.slicer;
 
-import com.google.protobuf.ByteString;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import javax.annotation.Nullable;
 
 final class SliceMap {
 
   static final class SliceEntry {
-    final ByteString startKey;
+    final byte[] startKey;
     final List<Integer> endpoints;
 
-    SliceEntry(ByteString startKey, List<Integer> endpoints) {
+    SliceEntry(byte[] startKey, List<Integer> endpoints) {
       this.startKey = startKey;
       this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
     }
   }
+
+  private static final byte[] EMPTY_BYTES = new byte[0];
 
   private final List<SliceEntry> slices;
   private final List<Integer> fallbackPool;
@@ -25,8 +25,7 @@ final class SliceMap {
 
   SliceMap(List<SliceEntry> slices, List<Integer> fallbackPool, long generation) {
     List<SliceEntry> sortedSlices = new ArrayList<>(slices);
-    sortedSlices.sort(
-        Comparator.comparing(e -> e.startKey, ByteString.unsignedLexicographicalComparator()));
+    sortedSlices.sort((e1, e2) -> compareUnsigned(e1.startKey, e2.startKey));
     this.slices = Collections.unmodifiableList(sortedSlices);
     this.fallbackPool = Collections.unmodifiableList(new ArrayList<>(fallbackPool));
     this.generation = generation;
@@ -37,25 +36,43 @@ final class SliceMap {
    * Returns null if slices is empty (e.g. startup/fallback case where there are no assignments).
    */
   @Nullable
-  Integer lookup(ByteString key) {
+  Integer lookup(@Nullable byte[] key) {
     if (slices.isEmpty()) {
       return null;
     }
-    int idx = Collections.binarySearch(slices, new SliceEntry(key, Collections.emptyList()), 
-        Comparator.comparing(e -> e.startKey, ByteString.unsignedLexicographicalComparator()));
+    byte[] searchKey = key != null ? key : EMPTY_BYTES;
+    int low = 0;
+    int high = slices.size() - 1;
 
-    if (idx >= 0) {
-      // Exact match on startKey
-      return idx;
-    } else {
-      // Insertion point (first slice where start_key > key)
-      int insertionPoint = -idx - 1;
-      if (insertionPoint == 0) {
-        // Key is smaller than first slice's startKey
-        return null;
+    while (low <= high) {
+      int mid = (low + high) >>> 1;
+      int cmp = compareUnsigned(slices.get(mid).startKey, searchKey);
+
+      if (cmp < 0) {
+        low = mid + 1;
+      } else if (cmp > 0) {
+        high = mid - 1;
+      } else {
+        return mid; // Exact match on startKey
       }
-      return insertionPoint - 1;
     }
+
+    if (low == 0) {
+      // Key is smaller than first slice's startKey
+      return null;
+    }
+    return low - 1;
+  }
+
+  private static int compareUnsigned(byte[] a, byte[] b) {
+    int minLength = Math.min(a.length, b.length);
+    for (int i = 0; i < minLength; i++) {
+      int result = (a[i] & 0xFF) - (b[i] & 0xFF);
+      if (result != 0) {
+        return result;
+      }
+    }
+    return a.length - b.length;
   }
 
   List<SliceEntry> getSlices() {
