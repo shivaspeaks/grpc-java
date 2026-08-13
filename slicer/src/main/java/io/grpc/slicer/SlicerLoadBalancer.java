@@ -32,9 +32,9 @@ import io.grpc.LoadBalancerProvider;
 import io.grpc.LoadBalancerRegistry;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
+import io.grpc.slicer.EndpointMap.EndpointHolder;
 import io.grpc.slicer.SliceMap.SliceEntry;
 import io.grpc.slicer.SlicerLoadBalancerProvider.SlicerConfig;
-import io.grpc.util.ForwardingLoadBalancerHelper;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.ArrayList;
@@ -96,7 +96,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
   private long initialAssignmentTimeoutNanos = TimeUnit.SECONDS.toNanos(60);
 
   // Endpoint map: hostname -> EndpointHolder
-  private final Map<String, EndpointHolder> endpointMap = new LinkedHashMap<>();
+  private final EndpointMap endpointMap = new EndpointMap();
 
   private SliceMap currentSliceMap;
   private List<SliceAssignment> latestSliceAssignments;
@@ -139,10 +139,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     // Process endpoints from Name Resolver
     List<EquivalentAddressGroup> addresses = resolvedAddresses.getAddresses();
     if (addresses.isEmpty()) {
-      for (EndpointHolder holder : endpointMap.values()) {
-        holder.shutdown();
-      }
-      endpointMap.clear();
+      endpointMap.shutdownAll();
       currentSliceMap = null;
       helper.updateBalancingState(
           TRANSIENT_FAILURE,
@@ -172,7 +169,8 @@ public final class SlicerLoadBalancer extends LoadBalancer {
 
       EndpointHolder holder = endpointMap.get(hostname);
       if (holder == null) {
-        holder = new EndpointHolder(index);
+        holder = new EndpointHolder(
+            index, helper, pickFirstProvider, this::updateAggregatedState);
         endpointMap.put(hostname, holder);
       } else {
         holder.index = index;
@@ -196,10 +194,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     }
 
     // Re-index remaining endpoints so indices form contiguous 0..N-1
-    int nextIdx = 0;
-    for (EndpointHolder holder : endpointMap.values()) {
-      holder.index = nextIdx++;
-    }
+    endpointMap.reindex();
 
     // Build slice map if assignment received or if timer has fired
     if (latestSliceAssignments != null || fallbackTimerFired) {
@@ -420,10 +415,7 @@ public final class SlicerLoadBalancer extends LoadBalancer {
       fallbackTimer.cancel();
       fallbackTimer = null;
     }
-    for (EndpointHolder holder : endpointMap.values()) {
-      holder.shutdown();
-    }
-    endpointMap.clear();
+    endpointMap.shutdownAll();
   }
 
   private static String getHostname(EquivalentAddressGroup eag) {
@@ -458,48 +450,6 @@ public final class SlicerLoadBalancer extends LoadBalancer {
     @Override
     public void onError(Throwable t) {
       logger.log(Level.WARNING, "ShardingClient stream error", t);
-    }
-  }
-
-  private final class EndpointHolder {
-    int index;
-    final LazyChildLoadBalancer childLb;
-    ConnectivityState state = IDLE;
-    SubchannelPicker picker = new FixedResultPicker(PickResult.withNoResult());
-
-    EndpointHolder(int index) {
-      this.index = index;
-      this.childLb = new LazyChildLoadBalancer(new ChildHelper(), pickFirstProvider);
-    }
-
-    void updateAddresses(List<EquivalentAddressGroup> eags, Attributes attributes) {
-      ResolvedAddresses childAddresses = ResolvedAddresses.newBuilder()
-          .setAddresses(eags)
-          .setAttributes(attributes)
-          .build();
-      childLb.acceptResolvedAddresses(childAddresses);
-    }
-
-    void requestConnection() {
-      childLb.requestConnection();
-    }
-
-    void shutdown() {
-      childLb.shutdown();
-    }
-
-    private final class ChildHelper extends ForwardingLoadBalancerHelper {
-      @Override
-      protected Helper delegate() {
-        return helper;
-      }
-
-      @Override
-      public void updateBalancingState(ConnectivityState newState, SubchannelPicker newPicker) {
-        state = newState;
-        picker = newPicker;
-        updateAggregatedState();
-      }
     }
   }
 }
