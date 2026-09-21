@@ -17,264 +17,542 @@
 package io.grpc.autosharding;
 
 import static com.google.common.truth.Truth.assertThat;
+import static io.grpc.ConnectivityState.CONNECTING;
 import static io.grpc.ConnectivityState.IDLE;
 import static io.grpc.ConnectivityState.READY;
 import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
-import static org.junit.Assert.assertThrows;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
 import io.grpc.Attributes;
+import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.Helper;
+import io.grpc.LoadBalancer.PickResult;
+import io.grpc.LoadBalancer.ResolvedAddresses;
 import io.grpc.LoadBalancer.SubchannelPicker;
 import io.grpc.LoadBalancerProvider;
+import io.grpc.Status;
 import io.grpc.SynchronizationContext;
-import io.grpc.autosharding.EndpointMap.EndpointHolder;
 import java.net.SocketAddress;
-import java.util.Collections;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
-import org.mockito.ArgumentCaptor;
 
+/** Unit tests for {@link EndpointMap}. */
 @RunWith(JUnit4.class)
 public class EndpointMapTest {
 
-  private final Helper mockHelper = mock(Helper.class);
-  private final LoadBalancerProvider mockProvider = mock(LoadBalancerProvider.class);
-  private final LoadBalancer mockDelegate = mock(LoadBalancer.class);
   private final SynchronizationContext syncContext =
-      new SynchronizationContext((t, e) -> {
-        throw new AssertionError("Unhandled exception in syncContext", e);
-      });
+      new SynchronizationContext(
+          (t, e) -> {
+            throw new AssertionError("Unhandled exception in syncContext", e);
+          });
+  private final Helper helper = mock(Helper.class);
+  private final FakeChildProvider childProvider = new FakeChildProvider();
+  private final List<Integer> stateUpdates = new ArrayList<>();
 
   private EndpointMap endpointMap;
-  private final AtomicInteger stateChangeCount = new AtomicInteger(0);
 
   @Before
   public void setUp() {
-    when(mockHelper.getSynchronizationContext()).thenReturn(syncContext);
-    when(mockProvider.newLoadBalancer(any())).thenReturn(mockDelegate);
-    endpointMap = new EndpointMap();
+    when(helper.getSynchronizationContext()).thenReturn(syncContext);
+    endpointMap = new EndpointMap(helper, childProvider, () -> stateUpdates.add(1));
   }
 
-  private EndpointHolder createHolder(int index) {
-    return new EndpointHolder(index, mockHelper, mockProvider, stateChangeCount::incrementAndGet);
+  // ---------------------------------------------------------------------------------------------
+  // Endpoint set and indices
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void updateEndpoints_assignsDenseIndicesInResolverOrder() {
+    endpointMap.updateEndpoints(endpoints("a", "b", "c"), Attributes.EMPTY);
+
+    assertThat(endpointMap.size()).isEqualTo(3);
+    assertThat(endpointMap.indexOf("a")).isEqualTo(0);
+    assertThat(endpointMap.indexOf("b")).isEqualTo(1);
+    assertThat(endpointMap.indexOf("c")).isEqualTo(2);
+    assertThat(endpointMap.toPickerEndpoints()).hasSize(3);
   }
 
   @Test
-  public void basicMapOperations() {
-    assertThat(endpointMap.isEmpty()).isTrue();
-    assertThat(endpointMap.size()).isEqualTo(0);
+  public void indexOf_unknownHostname_returnsMinusOne() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
 
-    EndpointHolder h1 = createHolder(0);
-    EndpointHolder h2 = createHolder(1);
+    assertThat(endpointMap.indexOf("nope")).isEqualTo(-1);
+  }
 
-    endpointMap.put("host1", h1);
-    endpointMap.put("host2", h2);
+  @Test
+  public void updateEndpoints_duplicateHostnames_keepsOneEntry() {
+    endpointMap.updateEndpoints(endpoints("a", "b", "a"), Attributes.EMPTY);
 
-    assertThat(endpointMap.isEmpty()).isFalse();
+    // Indices stay dense so that they remain valid offsets into toPickerEndpoints().
     assertThat(endpointMap.size()).isEqualTo(2);
-    assertThat(endpointMap.get("host1")).isSameInstanceAs(h1);
-    assertThat(endpointMap.get("host2")).isSameInstanceAs(h2);
-    assertThat(endpointMap.get("unknown")).isNull();
-    assertThat(endpointMap.keySet()).containsExactly("host1", "host2").inOrder();
-    assertThat(endpointMap.values()).containsExactly(h1, h2).inOrder();
+    assertThat(endpointMap.toPickerEndpoints()).hasSize(2);
+    assertThat(endpointMap.indexOf("a")).isEqualTo(0);
+    assertThat(endpointMap.indexOf("b")).isEqualTo(1);
+  }
 
-    EndpointHolder removed = endpointMap.remove("host1");
-    assertThat(removed).isSameInstanceAs(h1);
+  @Test
+  public void updateEndpoints_duplicateHostnames_firstEndpointSuppliesTheAddresses() {
+    EquivalentAddressGroup first = endpointWithHostname("first-addr", "a");
+    EquivalentAddressGroup second = endpointWithHostname("second-addr", "a");
+
+    endpointMap.updateEndpoints(ImmutableList.of(first, second), Attributes.EMPTY);
+    activate(0);
+
+    assertThat(childProvider.children).hasSize(1);
+    assertThat(childProvider.children.get(0).lastAddresses.getAddresses()).containsExactly(first);
+  }
+
+  @Test
+  public void updateEndpoints_reordering_movesIndicesAndPickerEndpoints() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+    activate(0);
+    reportState(0, READY);
+
+    endpointMap.updateEndpoints(endpoints("b", "a"), Attributes.EMPTY);
+
+    assertThat(endpointMap.indexOf("a")).isEqualTo(1);
+    assertThat(endpointMap.indexOf("b")).isEqualTo(0);
+    // The state moved with the endpoint, not with the index.
+    assertThat(stateAt(1)).isEqualTo(READY);
+    assertThat(stateAt(0)).isEqualTo(IDLE);
+  }
+
+  @Test
+  public void hostnameAttributeAbsent_fallsBackToFirstAddress() {
+    EquivalentAddressGroup eag = new EquivalentAddressGroup(new NamedAddress("1.2.3.4:80"));
+
+    endpointMap.updateEndpoints(ImmutableList.of(eag), Attributes.EMPTY);
+
+    assertThat(endpointMap.indexOf("1.2.3.4:80")).isEqualTo(0);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Child lifecycle across resolver updates
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void updateEndpoints_survivingHostname_keepsChildAndState() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+    reportState(0, READY);
+    assertThat(childProvider.children).hasSize(1);
+
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+
+    // No new child for "a", and its connectivity state survived the update.
+    assertThat(childProvider.children).hasSize(1);
+    assertThat(childProvider.children.get(0).shutdown).isFalse();
+    assertThat(stateAt(0)).isEqualTo(READY);
+  }
+
+  @Test
+  public void updateEndpoints_survivingHostname_forwardsNewAddresses() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+    FakeChild child = childProvider.children.get(0);
+    int acceptsBefore = child.acceptCount;
+
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+
+    assertThat(child.acceptCount).isGreaterThan(acceptsBefore);
+  }
+
+  @Test
+  public void updateEndpoints_removedHostname_shutsDownChild() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+    activate(0);
+    activate(1);
+
+    endpointMap.updateEndpoints(endpoints("b"), Attributes.EMPTY);
+
+    assertThat(childProvider.children.get(0).shutdown).isTrue();
+    assertThat(childProvider.children.get(1).shutdown).isFalse();
     assertThat(endpointMap.size()).isEqualTo(1);
-    assertThat(endpointMap.get("host1")).isNull();
+    assertThat(endpointMap.indexOf("a")).isEqualTo(-1);
   }
 
   @Test
-  public void nullChecks() {
-    EndpointHolder h = createHolder(0);
+  public void updateEndpoints_toEmpty_shutsDownEverything() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
 
-    assertThrows(NullPointerException.class, () -> endpointMap.get(null));
-    assertThrows(NullPointerException.class, () -> endpointMap.put(null, h));
-    assertThrows(NullPointerException.class, () -> endpointMap.put("host", null));
-    assertThrows(NullPointerException.class, () -> endpointMap.remove(null));
+    endpointMap.updateEndpoints(ImmutableList.of(), Attributes.EMPTY);
 
-    assertThrows(
-        NullPointerException.class,
-        () -> new EndpointHolder(0, null, mockProvider, null));
-    assertThrows(
-        NullPointerException.class,
-        () -> new EndpointHolder(0, mockHelper, null, null));
-
-    assertThrows(
-        NullPointerException.class,
-        () -> h.updateAddresses(null, Attributes.EMPTY));
-    assertThrows(
-        NullPointerException.class,
-        () -> h.updateAddresses(Collections.emptyList(), null));
-  }
-
-  @Test
-  public void reindex_updatesIndicesContiguously() {
-    EndpointHolder h0 = createHolder(0);
-    EndpointHolder h1 = createHolder(1);
-    EndpointHolder h2 = createHolder(2);
-
-    endpointMap.put("host0", h0);
-    endpointMap.put("host1", h1);
-    endpointMap.put("host2", h2);
-
-    // Remove middle element
-    endpointMap.remove("host1");
-    assertThat(h0.getIndex()).isEqualTo(0);
-    assertThat(h2.getIndex()).isEqualTo(2);
-
-    endpointMap.reindex();
-    assertThat(h0.getIndex()).isEqualTo(0);
-    assertThat(h2.getIndex()).isEqualTo(1);
-  }
-
-  @Test
-  public void endpointHolder_childHelperUpdatesStateAndTriggersCallback() {
-    EndpointHolder holder = createHolder(0);
-    assertThat(holder.getState()).isEqualTo(IDLE);
-
-    // Capture child helper passed to LazyChildLoadBalancer
-    ArgumentCaptor<Helper> helperCaptor = ArgumentCaptor.forClass(Helper.class);
-    verify(mockProvider, org.mockito.Mockito.never()).newLoadBalancer(any());
-
-    // Trigger connection to create child helper and delegate
-    holder.updateAddresses(
-        Collections.singletonList(new EquivalentAddressGroup(new SocketAddress() {})),
-        Attributes.EMPTY);
-    holder.requestConnection();
-
-    verify(mockProvider).newLoadBalancer(helperCaptor.capture());
-    Helper childHelper = helperCaptor.getValue();
-
-    // Reset counter before state update to verify callback fires on update
-    stateChangeCount.set(0);
-
-    // Simulate child balancer updating state
-    SubchannelPicker testPicker = mock(SubchannelPicker.class);
-    childHelper.updateBalancingState(READY, testPicker);
-
-    assertThat(holder.getState()).isEqualTo(READY);
-    assertThat(holder.getPicker()).isSameInstanceAs(testPicker);
-    assertThat(stateChangeCount.get()).isEqualTo(1);
-  }
-
-  @Test
-  public void toPickerEndpoints_buildsImmutableListMatchingHoldersByIndex() {
-    EndpointHolder h0 = createHolder(0);
-    EndpointHolder h1 = createHolder(1);
-
-    ArgumentCaptor<Helper> helperCaptor = ArgumentCaptor.forClass(Helper.class);
-
-    // Trigger connections so child helpers are passed to provider
-    h0.updateAddresses(
-        Collections.singletonList(new EquivalentAddressGroup(new SocketAddress() {})),
-        Attributes.EMPTY);
-    h0.requestConnection();
-
-    h1.updateAddresses(
-        Collections.singletonList(new EquivalentAddressGroup(new SocketAddress() {})),
-        Attributes.EMPTY);
-    h1.requestConnection();
-
-    verify(mockProvider, times(2)).newLoadBalancer(helperCaptor.capture());
-    Helper childHelper0 = helperCaptor.getAllValues().get(0);
-    Helper childHelper1 = helperCaptor.getAllValues().get(1);
-
-    SubchannelPicker picker0 = mock(SubchannelPicker.class);
-    SubchannelPicker picker1 = mock(SubchannelPicker.class);
-
-    childHelper0.updateBalancingState(READY, picker0);
-    childHelper1.updateBalancingState(TRANSIENT_FAILURE, picker1);
-
-    // Insert in reverse index order to verify explicit index placement
-    endpointMap.put("host1", h1);
-    endpointMap.put("host0", h0);
-
-    ImmutableList<PickerEndpoint> pickerEndpoints = endpointMap.toPickerEndpoints();
-    assertThat(pickerEndpoints).hasSize(2);
-    assertThat(pickerEndpoints.get(0).getState()).isEqualTo(READY);
-    assertThat(pickerEndpoints.get(0).getPicker()).isSameInstanceAs(picker0);
-    assertThat(pickerEndpoints.get(1).getState()).isEqualTo(TRANSIENT_FAILURE);
-    assertThat(pickerEndpoints.get(1).getPicker()).isSameInstanceAs(picker1);
-  }
-
-  @Test
-  public void toPickerEndpoints_emptyMap_returnsEmptyList() {
+    assertThat(endpointMap.size()).isEqualTo(0);
     assertThat(endpointMap.toPickerEndpoints()).isEmpty();
+    assertThat(childProvider.children.get(0).shutdown).isTrue();
   }
 
   @Test
-  public void toPickerEndpoints_duplicateOrOutOfBoundsIndex_throwsIllegalStateException() {
-    EndpointHolder h0 = createHolder(0);
-    EndpointHolder h0Duplicate = createHolder(0);
+  public void updateEndpoints_doesNotNotifyListenerWhileRebuilding() {
+    // New children publish their initial IDLE state from inside updateEndpoints(). Forwarding
+    // those would make the LB policy build a picker from a half-rebuilt map.
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
 
-    endpointMap.put("host0", h0);
-    endpointMap.put("host1", h0Duplicate);
-
-    assertThrows(IllegalStateException.class, () -> endpointMap.toPickerEndpoints());
-
-    endpointMap.clear();
-    EndpointHolder hOutOfBounds = createHolder(5);
-    endpointMap.put("host0", hOutOfBounds);
-
-    assertThrows(IllegalStateException.class, () -> endpointMap.toPickerEndpoints());
+    assertThat(stateUpdates).isEmpty();
   }
 
   @Test
-  public void shutdownAll_cleansUpAllHoldersAndClearsMap() {
-    EndpointHolder h0 = createHolder(0);
-    EndpointHolder h1 = createHolder(1);
+  public void childStateUpdate_notifiesListener() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+    stateUpdates.clear();
 
-    endpointMap.put("host0", h0);
-    endpointMap.put("host1", h1);
+    reportState(0, READY);
 
-    // Trigger connections so delegates exist
-    h0.updateAddresses(
-        Collections.singletonList(new EquivalentAddressGroup(new SocketAddress() {})),
-        Attributes.EMPTY);
-    h0.requestConnection();
-
-    endpointMap.shutdownAll();
-    assertThat(endpointMap.isEmpty()).isTrue();
-    verify(mockDelegate).shutdown();
+    assertThat(stateUpdates).hasSize(1);
+    assertThat(stateAt(0)).isEqualTo(READY);
   }
 
   @Test
-  public void toPickerEndpoint_requestConnection_wakesUpChildBalancerOnSyncContext() {
-    EndpointHolder holder = createHolder(0);
-    holder.updateAddresses(
-        Collections.singletonList(new EquivalentAddressGroup(new SocketAddress() {})),
-        Attributes.EMPTY);
+  public void childStateUpdate_afterEndpointRemoved_isIgnored() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+    FakeChild child = childProvider.children.get(0);
 
-    PickerEndpoint pickerEndpoint = holder.toPickerEndpoint();
-    verify(mockProvider, org.mockito.Mockito.never()).newLoadBalancer(any());
+    endpointMap.updateEndpoints(ImmutableList.of(), Attributes.EMPTY);
+    stateUpdates.clear();
+    child.report(READY, mock(SubchannelPicker.class));
 
-    // Trigger connection through PickerEndpoint (simulate AutoShardingPicker encountering IDLE)
-    pickerEndpoint.requestConnection();
+    assertThat(stateUpdates).isEmpty();
+  }
 
-    verify(mockProvider).newLoadBalancer(any());
-    verify(mockDelegate).acceptResolvedAddresses(any());
-    verify(mockDelegate).requestConnection();
+  // ---------------------------------------------------------------------------------------------
+  // Connecting lazily
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void endpointsStartIdleWithoutCreatingChildren() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+
+    assertThat(childProvider.children).isEmpty();
+    assertThat(stateAt(0)).isEqualTo(IDLE);
+    assertThat(stateAt(1)).isEqualTo(IDLE);
   }
 
   @Test
-  public void toString_containsDebugFields() {
-    EndpointHolder h = createHolder(3);
-    endpointMap.put("host3", h);
+  public void pickerEndpoint_requestConnection_createsChildAndConnects() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
 
-    assertThat(endpointMap.toString()).contains("host3");
-    assertThat(h.toString()).contains("index=3");
-    assertThat(h.toString()).contains("state=IDLE");
+    endpointMap.toPickerEndpoints().get(0).requestConnection();
+
+    assertThat(childProvider.children).hasSize(1);
+    assertThat(childProvider.children.get(0).requestConnectionCount).isEqualTo(1);
+  }
+
+  @Test
+  public void pickerEndpoint_repeatedRequestConnection_connectsOnce() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    // A single snapshot is shared by every concurrent RPC, so the same stale IDLE endpoint can
+    // be asked to connect many times over.
+    PickerEndpoint stale = endpointMap.toPickerEndpoints().get(0);
+
+    stale.requestConnection();
+    stale.requestConnection();
+    stale.requestConnection();
+
+    assertThat(childProvider.children).hasSize(1);
+    assertThat(childProvider.children.get(0).requestConnectionCount).isEqualTo(1);
+  }
+
+  @Test
+  public void pickerEndpoint_requestConnectionAfterEndpointRemoved_isNoOp() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    PickerEndpoint stale = endpointMap.toPickerEndpoints().get(0);
+
+    endpointMap.updateEndpoints(endpoints("b"), Attributes.EMPTY);
+    stale.requestConnection();
+
+    assertThat(childProvider.children).isEmpty();
+  }
+
+  @Test
+  public void pickerEndpoint_requestConnectionAfterShutdown_isNoOp() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    PickerEndpoint stale = endpointMap.toPickerEndpoints().get(0);
+
+    endpointMap.shutdown();
+    stale.requestConnection();
+
+    assertThat(childProvider.children).isEmpty();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Aggregated connectivity state (gRFC A42 rules)
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void aggregate_empty_isTransientFailure() {
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void aggregate_anyReady_isReady() {
+    setUpStates(TRANSIENT_FAILURE, TRANSIENT_FAILURE, READY);
+
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(READY);
+  }
+
+  @Test
+  public void aggregate_twoTransientFailures_isTransientFailure() {
+    setUpStates(TRANSIENT_FAILURE, TRANSIENT_FAILURE, IDLE);
+
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void aggregate_anyConnecting_isConnecting() {
+    setUpStates(IDLE, CONNECTING);
+
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(CONNECTING);
+  }
+
+  @Test
+  public void aggregate_oneTransientFailureAmongMany_isConnecting() {
+    setUpStates(TRANSIENT_FAILURE, IDLE);
+
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(CONNECTING);
+  }
+
+  @Test
+  public void aggregate_soleEndpointInTransientFailure_isTransientFailure() {
+    setUpStates(TRANSIENT_FAILURE);
+
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void aggregate_allIdle_isIdle() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+
+    assertThat(endpointMap.aggregateConnectivityState()).isEqualTo(IDLE);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Waking up an idle endpoint
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void maybeWakeUpIdleEndpoint_connectsLowestIndexedIdleEndpoint() {
+    setUpStates(TRANSIENT_FAILURE, IDLE, IDLE);
+
+    endpointMap.maybeWakeUpIdleEndpoint();
+
+    assertThat(stateAt(1)).isEqualTo(CONNECTING);
+    assertThat(stateAt(2)).isEqualTo(IDLE);
+  }
+
+  @Test
+  public void maybeWakeUpIdleEndpoint_somethingAlreadyConnecting_doesNothing() {
+    setUpStates(CONNECTING, IDLE);
+    int childrenBefore = childProvider.children.size();
+
+    endpointMap.maybeWakeUpIdleEndpoint();
+
+    assertThat(childProvider.children).hasSize(childrenBefore);
+    assertThat(stateAt(1)).isEqualTo(IDLE);
+  }
+
+  @Test
+  public void maybeWakeUpIdleEndpoint_noIdleEndpoints_doesNothing() {
+    setUpStates(TRANSIENT_FAILURE, TRANSIENT_FAILURE);
+    int childrenBefore = childProvider.children.size();
+
+    endpointMap.maybeWakeUpIdleEndpoint();
+
+    assertThat(childProvider.children).hasSize(childrenBefore);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Shutdown
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void shutdown_shutsDownChildrenAndEmptiesMap() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+    activate(0);
+    activate(1);
+
+    endpointMap.shutdown();
+
+    assertThat(childProvider.children.get(0).shutdown).isTrue();
+    assertThat(childProvider.children.get(1).shutdown).isTrue();
+    assertThat(endpointMap.size()).isEqualTo(0);
+    assertThat(endpointMap.indexOf("a")).isEqualTo(-1);
+  }
+
+  @Test
+  public void shutdown_isIdempotent() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+
+    endpointMap.shutdown();
+    endpointMap.shutdown();
+
+    assertThat(endpointMap.size()).isEqualTo(0);
+    assertThat(childProvider.children.get(0).shutdown).isTrue();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------------------------
+
+  /** Drives the endpoints at indices 0..n-1 into the given states. */
+  private void setUpStates(ConnectivityState... states) {
+    String[] names = new String[states.length];
+    for (int i = 0; i < states.length; i++) {
+      names[i] = "host" + i;
+    }
+    endpointMap.updateEndpoints(endpoints(names), Attributes.EMPTY);
+    for (int i = 0; i < states.length; i++) {
+      if (states[i] == IDLE) {
+        continue;
+      }
+      activate(i);
+      reportState(i, states[i]);
+    }
+    stateUpdates.clear();
+  }
+
+  /** Instantiates the child load balancer behind the endpoint at {@code index}. */
+  private void activate(int index) {
+    endpointMap.toPickerEndpoints().get(index).requestConnection();
+  }
+
+  private void reportState(int index, ConnectivityState state) {
+    childForHost(hostnames.get(index)).report(state, mock(SubchannelPicker.class));
+  }
+
+  private ConnectivityState stateAt(int index) {
+    return endpointMap.toPickerEndpoints().get(index).getState();
+  }
+
+  /** Returns the child load balancer created for {@code hostname}. */
+  private FakeChild childForHost(String hostname) {
+    for (FakeChild child : childProvider.children) {
+      if (child.lastAddresses == null) {
+        continue;
+      }
+      String childHostname =
+          child
+              .lastAddresses
+              .getAddresses()
+              .get(0)
+              .getAttributes()
+              .get(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME);
+      if (hostname.equals(childHostname)) {
+        return child;
+      }
+    }
+    throw new AssertionError("No child load balancer created for hostname " + hostname);
+  }
+
+  /** Hostnames of the endpoints most recently produced by {@link #endpoints}. */
+  private final List<String> hostnames = new ArrayList<>();
+
+  private List<EquivalentAddressGroup> endpoints(String... hostnameArgs) {
+    hostnames.clear();
+    List<EquivalentAddressGroup> eags = new ArrayList<>();
+    for (String hostname : hostnameArgs) {
+      hostnames.add(hostname);
+      eags.add(endpointWithHostname("addr-" + hostname, hostname));
+    }
+    return ImmutableList.copyOf(eags);
+  }
+
+  /** An endpoint at {@code addressName} advertising {@code hostname}. */
+  private static EquivalentAddressGroup endpointWithHostname(String addressName, String hostname) {
+    return new EquivalentAddressGroup(
+        new NamedAddress(addressName),
+        Attributes.newBuilder()
+            .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, hostname)
+            .build());
+  }
+
+  /** A {@link SocketAddress} with a predictable {@link #toString}. */
+  private static final class NamedAddress extends SocketAddress {
+    private static final long serialVersionUID = 0L;
+    private final String name;
+
+    NamedAddress(String name) {
+      this.name = name;
+    }
+
+    @Override
+    public String toString() {
+      return name;
+    }
+  }
+
+  private static final class FakeChildProvider extends LoadBalancerProvider {
+    final List<FakeChild> children = new ArrayList<>();
+
+    @Override
+    public boolean isAvailable() {
+      return true;
+    }
+
+    @Override
+    public int getPriority() {
+      return 5;
+    }
+
+    @Override
+    public String getPolicyName() {
+      return "fake_child";
+    }
+
+    @Override
+    public LoadBalancer newLoadBalancer(Helper helper) {
+      FakeChild child = new FakeChild(helper);
+      children.add(child);
+      return child;
+    }
+  }
+
+  /** Stands in for {@code pick_first}, including its move to CONNECTING when asked to connect. */
+  private static final class FakeChild extends LoadBalancer {
+    private final Helper helper;
+    ResolvedAddresses lastAddresses;
+    int acceptCount;
+    int requestConnectionCount;
+    boolean shutdown;
+
+    FakeChild(Helper helper) {
+      this.helper = helper;
+    }
+
+    @Override
+    public Status acceptResolvedAddresses(ResolvedAddresses resolvedAddresses) {
+      lastAddresses = resolvedAddresses;
+      acceptCount++;
+      return Status.OK;
+    }
+
+    @Override
+    public void handleNameResolutionError(Status error) {}
+
+    @Override
+    public void requestConnection() {
+      requestConnectionCount++;
+      report(CONNECTING, new FixedResultPicker(PickResult.withNoResult()));
+    }
+
+    @Override
+    public void shutdown() {
+      shutdown = true;
+    }
+
+    void report(ConnectivityState state, SubchannelPicker picker) {
+      helper.updateBalancingState(state, picker);
+    }
   }
 }

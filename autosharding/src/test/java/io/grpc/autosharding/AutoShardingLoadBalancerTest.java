@@ -1,0 +1,961 @@
+/*
+ * Copyright 2026 The gRPC Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.grpc.autosharding;
+
+import static com.google.common.truth.Truth.assertThat;
+import static io.grpc.ConnectivityState.CONNECTING;
+import static io.grpc.ConnectivityState.IDLE;
+import static io.grpc.ConnectivityState.READY;
+import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
+import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+import com.google.cloud.autosharding.v1.AssignmentChunk;
+import com.google.cloud.autosharding.v1.AssignmentMetadata;
+import com.google.cloud.autosharding.v1.AutoshardingServiceGrpc;
+import com.google.cloud.autosharding.v1.EndpointState;
+import com.google.cloud.autosharding.v1.PerSliceEndpointState;
+import com.google.cloud.autosharding.v1.SliceAssignment;
+import com.google.cloud.autosharding.v1.WatchShardingAssignmentRequest;
+import com.google.cloud.autosharding.v1.WatchShardingAssignmentResponse;
+import com.google.common.collect.ImmutableList;
+import com.google.protobuf.ByteString;
+import io.grpc.Attributes;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ConnectivityState;
+import io.grpc.EquivalentAddressGroup;
+import io.grpc.LoadBalancer;
+import io.grpc.LoadBalancer.Helper;
+import io.grpc.LoadBalancer.PickDetailsConsumer;
+import io.grpc.LoadBalancer.PickResult;
+import io.grpc.LoadBalancer.ResolvedAddresses;
+import io.grpc.LoadBalancer.Subchannel;
+import io.grpc.LoadBalancer.SubchannelPicker;
+import io.grpc.LoadBalancerProvider;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+import io.grpc.Status;
+import io.grpc.SynchronizationContext;
+import io.grpc.inprocess.InProcessChannelBuilder;
+import io.grpc.inprocess.InProcessServerBuilder;
+import io.grpc.internal.FakeClock;
+import io.grpc.internal.PickSubchannelArgsImpl;
+import io.grpc.stub.StreamObserver;
+import io.grpc.testing.GrpcCleanupRule;
+import io.grpc.testing.TestMethodDescriptors;
+import java.net.SocketAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.annotation.Nullable;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
+
+/**
+ * Unit tests for {@link AutoShardingLoadBalancer}.
+ *
+ * <p>These drive a real {@link AutoshardingClient} against an in-process fake sharding service,
+ * so the path from a served assignment through to a routed pick is covered end to end.
+ */
+@RunWith(JUnit4.class)
+public class AutoShardingLoadBalancerTest {
+  private static final String CHANNEL_FACTORY_KEY = "shard-service-key";
+  private static final String OTHER_CHANNEL_FACTORY_KEY = "other-shard-service-key";
+  private static final String UNKNOWN_CHANNEL_FACTORY_KEY = "unknown-key";
+  private static final String TARGET = "autosharding-target";
+  private static final String KEY_HEADER = "x-shard-key";
+  private static final long ASSIGNMENT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
+  private static final long POLL_TIMEOUT_SECONDS = 5;
+  private static final MethodDescriptor<Void, Void> METHOD = TestMethodDescriptors.voidMethod();
+
+  @Rule public final GrpcCleanupRule grpcCleanup = new GrpcCleanupRule();
+
+  private final SynchronizationContext syncContext =
+      new SynchronizationContext(
+          (t, e) -> {
+            throw new AssertionError(e);
+          });
+  private final FakeClock fakeClock = new FakeClock();
+  private final FakeAutoshardingService service = new FakeAutoshardingService();
+  private final Helper helper = mock(Helper.class);
+  private final FakeChildProvider childProvider = new FakeChildProvider();
+  private final FakeChannelFactory channelFactory = new FakeChannelFactory();
+
+  private Channel shardingChannel;
+  private AutoShardingLoadBalancer loadBalancer;
+
+  @Nullable private ConnectivityState currentState;
+  @Nullable private SubchannelPicker currentPicker;
+  @Nullable private StreamObserver<WatchShardingAssignmentResponse> serverStream;
+  private int balancingStateUpdates;
+
+  @Before
+  public void setUp() throws Exception {
+    String serverName = InProcessServerBuilder.generateName();
+    grpcCleanup.register(
+        InProcessServerBuilder.forName(serverName)
+            .directExecutor()
+            .addService(service)
+            .build()
+            .start());
+    shardingChannel =
+        grpcCleanup.register(InProcessChannelBuilder.forName(serverName).directExecutor().build());
+
+    when(helper.getSynchronizationContext()).thenReturn(syncContext);
+    when(helper.getScheduledExecutorService()).thenReturn(fakeClock.getScheduledExecutorService());
+    doAnswer(
+            invocation -> {
+              currentState = invocation.getArgument(0);
+              currentPicker = invocation.getArgument(1);
+              balancingStateUpdates++;
+              return null;
+            })
+        .when(helper)
+        .updateBalancingState(any(ConnectivityState.class), any(SubchannelPicker.class));
+
+    loadBalancer =
+        new AutoShardingLoadBalancer(
+            helper,
+            childProvider,
+            () -> () -> TimeUnit.SECONDS.toNanos(1),
+            fakeClock.getStopwatchSupplier(),
+            "client-uuid");
+  }
+
+  @After
+  public void tearDown() {
+    // Must run before GrpcCleanupRule terminates the channel, otherwise the assignment client
+    // keeps retrying against a shutting-down channel.
+    syncContext.execute(loadBalancer::shutdown);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Configuration handling
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void missingConfig_reportsTransientFailure() {
+    Status status =
+        acceptAddresses(
+            ResolvedAddresses.newBuilder()
+                .setAddresses(endpoints("a"))
+                .setAttributes(attributesWithChannelFactory())
+                .build());
+
+    assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void missingChannelFactory_reportsTransientFailure() {
+    Status status =
+        acceptAddresses(
+            ResolvedAddresses.newBuilder()
+                .setAddresses(endpoints("a"))
+                .setAttributes(Attributes.EMPTY)
+                .setLoadBalancingPolicyConfig(config(CHANNEL_FACTORY_KEY, true))
+                .build());
+
+    assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(status.getDescription()).contains("channel factory");
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void unknownChannelFactoryKey_reportsTransientFailure() {
+    Status status = deliverAddresses(config(UNKNOWN_CHANNEL_FACTORY_KEY, true), "a");
+
+    assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void noEndpoints_reportsTransientFailureAndFailsRpcs() {
+    Status status = deliverAddresses(config(CHANNEL_FACTORY_KEY, true));
+
+    assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("anything").getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+  }
+
+  @Test
+  public void endpointsRetracted_thenRestored_resumesServing() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "a"));
+
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true));
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    reportReady("a");
+
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Channel to the sharding service
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void firstUpdate_createsChannelAndOpensStream() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+
+    assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
+    WatchShardingAssignmentRequest request = takeRequest();
+    assertThat(request.getInitialClientConfig().getTarget()).isEqualTo(TARGET);
+    assertThat(request.getInitialClientConfig().getClientUuid()).isEqualTo("client-uuid");
+  }
+
+  @Test
+  public void unchangedKey_reusesChannelAndStream() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    takeRequest();
+
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+
+    assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
+    assertThat(service.streamCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void changedKey_createsNewChannelClosesOldAndRestartsStream() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    takeRequest();
+
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, true), "a");
+
+    assertThat(channelFactory.keys)
+        .containsExactly(CHANNEL_FACTORY_KEY, OTHER_CHANNEL_FACTORY_KEY)
+        .inOrder();
+    assertThat(channelFactory.isReleased(0)).isTrue();
+    assertThat(channelFactory.isReleased(1)).isFalse();
+    assertThat(service.streamCount.get()).isEqualTo(2);
+  }
+
+  @Test
+  public void changedTarget_restartsStreamWithoutNewChannel() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    takeRequest();
+
+    AutoShardingLoadBalancerConfig retargeted =
+        new AutoShardingLoadBalancerConfig(
+            CHANNEL_FACTORY_KEY, "other-target", KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
+    deliverAddresses(retargeted, "a");
+
+    assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
+    assertThat(service.streamCount.get()).isEqualTo(2);
+    assertThat(takeRequest().getInitialClientConfig().getTarget()).isEqualTo("other-target");
+  }
+
+  @Test
+  public void targetWithLocalityToken_isSubstituted() throws Exception {
+    AutoShardingLoadBalancerConfig localityConfig =
+        new AutoShardingLoadBalancerConfig(
+            CHANNEL_FACTORY_KEY, "target/%s", KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
+    EquivalentAddressGroup endpoint =
+        new EquivalentAddressGroup(
+            new NamedAddress("addr-a"),
+            Attributes.newBuilder()
+                .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, "a")
+                .set(EquivalentAddressGroup.ATTR_LOCALITY_NAME, "us-central1-a")
+                .build());
+
+    acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(ImmutableList.of(endpoint))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(localityConfig)
+            .build());
+
+    assertThat(takeRequest().getInitialClientConfig().getTarget())
+        .isEqualTo("target/us-central1-a");
+  }
+
+  @Test
+  public void targetWithLocalityToken_noLocality_substitutesEmptyString() throws Exception {
+    AutoShardingLoadBalancerConfig localityConfig =
+        new AutoShardingLoadBalancerConfig(
+            CHANNEL_FACTORY_KEY, "target/%s", KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
+
+    deliverAddresses(localityConfig, "a");
+
+    assertThat(takeRequest().getInitialClientConfig().getTarget()).isEqualTo("target/");
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Startup: queuing, timeout and fallback
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void beforeFirstAssignment_queuesRpcs() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+
+    assertThat(currentState).isEqualTo(CONNECTING);
+    PickResult result = pick("anything");
+    assertThat(result.getSubchannel()).isNull();
+    assertThat(result.getStatus().isOk()).isTrue();
+  }
+
+  @Test
+  public void beforeFirstAssignment_childStateChangesDoNotUnqueueRpcs() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    activate("a");
+    reportReady("a");
+
+    // Still waiting on the sharding service, so RPCs stay queued rather than being routed
+    // anywhere arbitrary.
+    assertThat(currentState).isEqualTo(CONNECTING);
+    assertThat(pick("k").getSubchannel()).isNull();
+  }
+
+  @Test
+  public void initialAssignmentTimeout_fallbackEnabled_spreadsAcrossAllEndpoints() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    reportReady("a");
+    reportReady("b");
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
+  }
+
+  @Test
+  public void initialAssignmentTimeout_fallbackDisabled_failsRpcs() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+    reportReady("a");
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+
+    PickResult result = pick("k");
+    assertThat(result.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(result.getStatus().getDescription()).contains("fallback disabled");
+  }
+
+  @Test
+  public void assignmentBeforeTimeout_cancelsTheTimer() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+
+    deliverAssignment(1, slice("", "a"));
+
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+  }
+
+  @Test
+  public void newChannel_keepsServingPreviousAssignmentWhileTimerPending() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "a"), slice("m", "b"));
+    reportReady("a");
+    reportReady("b");
+    assertThat(pickedHost(pick("z"))).isEqualTo("b");
+
+    // Switching sharding service must not interrupt traffic.
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, true), "a", "b");
+
+    assertThat(pickedHost(pick("z"))).isEqualTo("b");
+    assertThat(pickedHost(pick("a"))).isEqualTo("a");
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Routing on assignments
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void assignmentRoutesByKeyRange() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "a"), slice("m", "b"));
+    reportReady("a");
+    reportReady("b");
+
+    assertThat(pickedHost(pick("alpha"))).isEqualTo("a");
+    assertThat(pickedHost(pick("zulu"))).isEqualTo("b");
+  }
+
+  @Test
+  public void assignmentNamingUnknownHostname_dropsIt() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+    // The sharding service still believes "ghost" is serving; the resolver disagrees.
+    deliverAssignment(1, slice("", "ghost"));
+    reportReady("a");
+
+    PickResult result = pick("k");
+    assertThat(result.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+  }
+
+  @Test
+  public void assignmentNamingUnknownHostname_fallbackEnabled_usesFallbackPool() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "ghost"));
+    reportReady("a");
+
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  @Test
+  public void resolverUpdateAfterAssignment_rebuildsSliceMapWithNewIndices() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "b"));
+    reportReady("a");
+    reportReady("b");
+    assertThat(pickedHost(pick("k"))).isEqualTo("b");
+
+    // "b" moves from index 1 to index 0. If the slice map were not rebuilt, the stale index
+    // would now route to "a".
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "b", "a");
+
+    assertThat(pickedHost(pick("k"))).isEqualTo("b");
+  }
+
+  @Test
+  public void staleGenerationAssignment_isIgnored() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(5, slice("", "a"));
+    reportReady("a");
+    reportReady("b");
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+
+    pushAssignment(3, slice("", "b"));
+
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Child state updates and aggregated connectivity state
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void childStateUpdate_republishesPicker() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "a"));
+    int updatesBefore = balancingStateUpdates;
+
+    reportReady("a");
+
+    assertThat(balancingStateUpdates).isGreaterThan(updatesBefore);
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  @Test
+  public void allEndpointsIdle_reportsIdle() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "a"));
+
+    assertThat(currentState).isEqualTo(IDLE);
+  }
+
+  @Test
+  public void twoEndpointsInTransientFailure_reportsTransientFailure() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "a"), slice("m", "b"));
+
+    reportTransientFailure("a");
+    reportTransientFailure("b");
+
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+  }
+
+  @Test
+  public void oneEndpointInTransientFailure_wakesUpAnIdleEndpoint() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b", "c");
+    deliverAssignment(1, slice("", "a"));
+
+    reportTransientFailure("a");
+
+    // Aggregated state is CONNECTING, and nothing was connecting, so exactly one IDLE endpoint
+    // is nudged so the policy can recover without needing a pick.
+    assertThat(currentState).isEqualTo(CONNECTING);
+    assertThat(childProvider.children).hasSize(2);
+    assertThat(childForHost("b").requestConnectionCount).isEqualTo(1);
+  }
+
+  @Test
+  public void endpointAlreadyConnecting_noAdditionalWakeUp() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b", "c");
+    deliverAssignment(1, slice("", "a"));
+    activate("b");
+
+    reportTransientFailure("a");
+
+    // "b" is already CONNECTING, so "c" is left alone.
+    assertThat(currentState).isEqualTo(CONNECTING);
+    assertThat(activatedHostnames()).containsExactly("a", "b");
+  }
+
+  @Test
+  public void requestConnection_wakesUpAnIdleEndpoint() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+
+    syncContext.execute(loadBalancer::requestConnection);
+
+    assertThat(childProvider.children).hasSize(1);
+  }
+
+  @Test
+  public void picksOnIdleEndpointTriggerConnection() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "a"));
+    assertThat(childProvider.children).isEmpty();
+
+    PickResult result = pick("k");
+
+    assertThat(result.getSubchannel()).isNull();
+    assertThat(childProvider.children).hasSize(1);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Name resolution errors and shutdown
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void nameResolutionError_withKnownEndpoints_keepsServing() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "a"));
+    reportReady("a");
+
+    syncContext.execute(
+        () -> loadBalancer.handleNameResolutionError(Status.UNAVAILABLE.withDescription("boom")));
+
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  @Test
+  public void nameResolutionError_withNoEndpoints_reportsTransientFailure() {
+    syncContext.execute(
+        () -> loadBalancer.handleNameResolutionError(Status.UNAVAILABLE.withDescription("boom")));
+
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("k").getStatus().getDescription()).contains("boom");
+  }
+
+  @Test
+  public void shutdown_closesChannelAndChildren() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    activate("a");
+
+    syncContext.execute(loadBalancer::shutdown);
+
+    assertThat(channelFactory.isReleased(0)).isTrue();
+    assertThat(childProvider.children.get(0).shutdown).isTrue();
+  }
+
+  @Test
+  public void shutdown_isIdempotent() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+
+    syncContext.execute(loadBalancer::shutdown);
+    syncContext.execute(loadBalancer::shutdown);
+
+    assertThat(channelFactory.isReleased(0)).isTrue();
+  }
+
+  @Test
+  public void shutdown_cancelsInitialAssignmentTimer() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+
+    syncContext.execute(loadBalancer::shutdown);
+
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------------------------
+
+  private AutoShardingLoadBalancerConfig config(String channelFactoryKey, boolean enableFallback) {
+    return new AutoShardingLoadBalancerConfig(
+        channelFactoryKey, TARGET, KEY_HEADER, enableFallback, ASSIGNMENT_TIMEOUT_NANOS);
+  }
+
+  private Attributes attributesWithChannelFactory() {
+    return Attributes.newBuilder()
+        .set(AutoShardingAttributes.ATTR_CHANNEL_FACTORY, channelFactory)
+        .build();
+  }
+
+  private Status deliverAddresses(AutoShardingLoadBalancerConfig config, String... hostnames) {
+    return acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(endpoints(hostnames))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(config)
+            .build());
+  }
+
+  private Status acceptAddresses(ResolvedAddresses resolvedAddresses) {
+    AtomicReference<Status> status = new AtomicReference<>();
+    syncContext.execute(() -> status.set(loadBalancer.acceptResolvedAddresses(resolvedAddresses)));
+    return status.get();
+  }
+
+  private static List<EquivalentAddressGroup> endpoints(String... hostnames) {
+    List<EquivalentAddressGroup> eags = new ArrayList<>();
+    for (String hostname : hostnames) {
+      eags.add(
+          new EquivalentAddressGroup(
+              new NamedAddress("addr-" + hostname),
+              Attributes.newBuilder()
+                  .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, hostname)
+                  .build()));
+    }
+    return ImmutableList.copyOf(eags);
+  }
+
+  /** Sends an assignment from the fake service and waits for the load balancer to apply it. */
+  private void deliverAssignment(long generation, SliceSpec... slices) throws Exception {
+    pushAssignment(generation, slices);
+  }
+
+  private void pushAssignment(long generation, SliceSpec... slices) throws Exception {
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = currentServerStream();
+    List<String> endpointNames = new ArrayList<>();
+    for (SliceSpec spec : slices) {
+      if (!endpointNames.contains(spec.hostname)) {
+        endpointNames.add(spec.hostname);
+      }
+    }
+
+    AssignmentChunk.Builder chunk = AssignmentChunk.newBuilder();
+    for (String name : endpointNames) {
+      chunk.addEndpoints(EndpointState.newBuilder().setEndpoint(name));
+    }
+    for (int i = 0; i < slices.length; i++) {
+      SliceSpec spec = slices[i];
+      String endKey = i + 1 < slices.length ? slices[i + 1].startKey : null;
+      chunk.addSliceAssignments(
+          sliceAssignment(spec.startKey, endKey, endpointNames.indexOf(spec.hostname)));
+    }
+
+    serverStream.onNext(WatchShardingAssignmentResponse.newBuilder().setChunk(chunk).build());
+    serverStream.onNext(
+        WatchShardingAssignmentResponse.newBuilder()
+            .setMetadata(AssignmentMetadata.newBuilder().setGeneration(generation))
+            .build());
+  }
+
+  private static SliceSpec slice(String startKey, String hostname) {
+    return new SliceSpec(startKey, hostname);
+  }
+
+  private static final class SliceSpec {
+    final String startKey;
+    final String hostname;
+
+    SliceSpec(String startKey, String hostname) {
+      this.startKey = startKey;
+      this.hostname = hostname;
+    }
+  }
+
+  private static SliceAssignment sliceAssignment(
+      String startKey, @Nullable String endKey, int endpointIndex) {
+    com.google.cloud.autosharding.v1.Slice.Builder slice =
+        com.google.cloud.autosharding.v1.Slice.newBuilder()
+            .setStartKey(ByteString.copyFromUtf8(startKey));
+    if (endKey != null) {
+      slice.setEndKey(ByteString.copyFromUtf8(endKey));
+    }
+    return SliceAssignment.newBuilder()
+        .setSlice(slice)
+        .addEndpoints(PerSliceEndpointState.newBuilder().setEndpointIndex(endpointIndex))
+        .build();
+  }
+
+  private PickResult pick(String key) {
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of(KEY_HEADER, Metadata.ASCII_STRING_MARSHALLER), key);
+    return currentPicker.pickSubchannel(
+        new PickSubchannelArgsImpl(METHOD, headers, CallOptions.DEFAULT, new PickDetailsConsumer() {
+        }));
+  }
+
+  /** Returns the hostname of the endpoint the pick landed on. */
+  private String pickedHost(PickResult result) {
+    Subchannel subchannel = result.getSubchannel();
+    if (subchannel == null) {
+      throw new AssertionError("Pick did not select a subchannel: " + result);
+    }
+    for (FakeChild child : childProvider.children) {
+      if (child.subchannel == subchannel) {
+        return child.hostname;
+      }
+    }
+    throw new AssertionError("Pick returned an unrecognized subchannel");
+  }
+
+  /**
+   * Instantiates the child load balancer for {@code hostname} by asking its endpoint to connect,
+   * which is how the picker brings an endpoint out of IDLE at runtime.
+   */
+  private void activate(String hostname) {
+    syncContext.execute(
+        () -> {
+          EndpointMap endpointMap = loadBalancer.getEndpointMap();
+          int index = endpointMap.indexOf(hostname);
+          if (index == -1) {
+            throw new AssertionError("Unknown endpoint hostname " + hostname);
+          }
+          endpointMap.toPickerEndpoints().get(index).requestConnection();
+        });
+  }
+
+  private void reportReady(String hostname) {
+    activate(hostname);
+    syncContext.execute(() -> childForHost(hostname).reportReady());
+  }
+
+  private void reportTransientFailure(String hostname) {
+    activate(hostname);
+    syncContext.execute(() -> childForHost(hostname).reportTransientFailure());
+  }
+
+  private FakeChild childForHost(String hostname) {
+    for (FakeChild child : childProvider.children) {
+      if (hostname.equals(child.hostname)) {
+        return child;
+      }
+    }
+    throw new AssertionError("No child load balancer for hostname " + hostname);
+  }
+
+  private WatchShardingAssignmentRequest takeRequest() throws Exception {
+    WatchShardingAssignmentRequest request =
+        service.requests.poll(POLL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    if (request == null) {
+      fail("timed out waiting for a request to the sharding service");
+    }
+    return request;
+  }
+
+  /**
+   * Returns the stream the client currently has open to the sharding service, picking up a newly
+   * opened one if there is any. Streams are created synchronously by the in-process transport, so
+   * a non-blocking poll is enough once the first one exists.
+   */
+  private StreamObserver<WatchShardingAssignmentResponse> currentServerStream() throws Exception {
+    StreamObserver<WatchShardingAssignmentResponse> next = service.serverStreams.poll();
+    if (next != null) {
+      serverStream = next;
+    } else if (serverStream == null) {
+      serverStream = service.serverStreams.poll(POLL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+      if (serverStream == null) {
+        fail("timed out waiting for a stream to the sharding service");
+      }
+    }
+    return serverStream;
+  }
+
+  /** Hostnames whose child load balancer has been instantiated, in creation order. */
+  private List<String> activatedHostnames() {
+    List<String> result = new ArrayList<>();
+    for (FakeChild child : childProvider.children) {
+      result.add(child.hostname);
+    }
+    return result;
+  }
+
+  /** A {@link SocketAddress} with a predictable {@link #toString}. */
+  private static final class NamedAddress extends SocketAddress {
+    private static final long serialVersionUID = 0L;
+    private final String name;
+
+    NamedAddress(String name) {
+      this.name = name;
+    }
+
+    @Override
+    public String toString() {
+      return name;
+    }
+  }
+
+  /**
+   * Hands out in-process channels, each wrapped so that successive borrows are distinguishable
+   * even though they share one transport.
+   */
+  private final class FakeChannelFactory implements ChannelFactory {
+    final List<String> keys = new ArrayList<>();
+    final List<Channel> created = new ArrayList<>();
+    final List<Channel> released = new ArrayList<>();
+
+    @Override
+    public Channel createChannel(String channelFactoryKey) {
+      if (UNKNOWN_CHANNEL_FACTORY_KEY.equals(channelFactoryKey)) {
+        throw new IllegalArgumentException("unknown channel factory key");
+      }
+      keys.add(channelFactoryKey);
+      Channel channel = new WrappedChannel(shardingChannel);
+      created.add(channel);
+      return channel;
+    }
+
+    @Override
+    public void releaseChannel(Channel channel) {
+      released.add(channel);
+    }
+
+    boolean isReleased(int index) {
+      Channel channel = created.get(index);
+      for (Channel released : this.released) {
+        if (released == channel) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  /** Gives each handle a distinct channel identity over one shared transport. */
+  private static final class WrappedChannel extends Channel {
+    private final Channel delegate;
+
+    WrappedChannel(Channel delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public String authority() {
+      return delegate.authority();
+    }
+
+    @Override
+    public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
+        MethodDescriptor<ReqT, RespT> methodDescriptor, CallOptions callOptions) {
+      return delegate.newCall(methodDescriptor, callOptions);
+    }
+  }
+
+  private static final class FakeAutoshardingService
+      extends AutoshardingServiceGrpc.AutoshardingServiceImplBase {
+    final BlockingQueue<WatchShardingAssignmentRequest> requests = new LinkedBlockingQueue<>();
+    final BlockingQueue<StreamObserver<WatchShardingAssignmentResponse>> serverStreams =
+        new LinkedBlockingQueue<>();
+    final AtomicInteger streamCount = new AtomicInteger();
+
+    @Override
+    public StreamObserver<WatchShardingAssignmentRequest> watchShardingAssignment(
+        StreamObserver<WatchShardingAssignmentResponse> responseObserver) {
+      streamCount.incrementAndGet();
+      serverStreams.add(responseObserver);
+      return new StreamObserver<WatchShardingAssignmentRequest>() {
+        @Override
+        public void onNext(WatchShardingAssignmentRequest request) {
+          requests.add(request);
+        }
+
+        @Override
+        public void onError(Throwable t) {}
+
+        @Override
+        public void onCompleted() {}
+      };
+    }
+  }
+
+  private static final class FakeChildProvider extends LoadBalancerProvider {
+    final List<FakeChild> children = new ArrayList<>();
+
+    @Override
+    public boolean isAvailable() {
+      return true;
+    }
+
+    @Override
+    public int getPriority() {
+      return 5;
+    }
+
+    @Override
+    public String getPolicyName() {
+      return "fake_child";
+    }
+
+    @Override
+    public LoadBalancer newLoadBalancer(Helper childHelper) {
+      FakeChild child = new FakeChild(childHelper);
+      children.add(child);
+      return child;
+    }
+  }
+
+  /** Stands in for {@code pick_first}, reporting CONNECTING as soon as it is asked to connect. */
+  private static final class FakeChild extends LoadBalancer {
+    private final Helper helper;
+    final Subchannel subchannel = mock(Subchannel.class);
+    @Nullable String hostname;
+    int requestConnectionCount;
+    boolean shutdown;
+
+    FakeChild(Helper helper) {
+      this.helper = helper;
+    }
+
+    @Override
+    public Status acceptResolvedAddresses(ResolvedAddresses resolvedAddresses) {
+      hostname =
+          resolvedAddresses
+              .getAddresses()
+              .get(0)
+              .getAttributes()
+              .get(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME);
+      return Status.OK;
+    }
+
+    @Override
+    public void handleNameResolutionError(Status error) {}
+
+    @Override
+    public void requestConnection() {
+      requestConnectionCount++;
+      helper.updateBalancingState(CONNECTING, new FixedResultPicker(PickResult.withNoResult()));
+    }
+
+    @Override
+    public void shutdown() {
+      shutdown = true;
+    }
+
+    void reportReady() {
+      helper.updateBalancingState(READY, new FixedResultPicker(PickResult.withSubchannel(
+          subchannel)));
+    }
+
+    void reportTransientFailure() {
+      helper.updateBalancingState(
+          TRANSIENT_FAILURE,
+          new FixedResultPicker(
+              PickResult.withError(Status.UNAVAILABLE.withDescription("endpoint down"))));
+    }
+  }
+}

@@ -17,240 +17,398 @@
 package io.grpc.autosharding;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.base.Preconditions.checkState;
+import static io.grpc.ConnectivityState.CONNECTING;
 import static io.grpc.ConnectivityState.IDLE;
+import static io.grpc.ConnectivityState.READY;
+import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 import io.grpc.Attributes;
 import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
-import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.FixedResultPicker;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.PickResult;
 import io.grpc.LoadBalancer.ResolvedAddresses;
 import io.grpc.LoadBalancer.SubchannelPicker;
+import io.grpc.LoadBalancerProvider;
+import io.grpc.Status;
+import io.grpc.SynchronizationContext;
 import io.grpc.util.ForwardingLoadBalancerHelper;
 import io.grpc.util.LazyLoadBalancer;
-import java.util.Collection;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
-import javax.annotation.Nullable;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.annotation.concurrent.NotThreadSafe;
 
 /**
- * Manages the mapping from endpoint hostname to {@link EndpointHolder} and coordinates
- * child load balancer lifecycle and connectivity state updates.
+ * Owns one lazily-created {@code pick_first} child load balancer per resolved endpoint, keyed by
+ * endpoint hostname, and tracks the connectivity state and picker most recently reported by each
+ * child.
  *
- * <p>Threading model: This class is not thread-safe. All methods must be invoked from the
- * {@link io.grpc.SynchronizationContext} by the parent load balancer.
+ * <h3>Endpoint indices</h3>
+ *
+ * <p>Endpoints are identified throughout the LB policy by a dense index in {@code [0, size)}.
+ * The index of an endpoint is simply its position in the list most recently passed to
+ * {@link #updateEndpoints}, after duplicate hostnames have been dropped. Indices are not stored
+ * anywhere; they are a property of the map's iteration order. This makes it impossible for
+ * indices handed out by {@link #indexOf} to disagree with the positions in the list returned by
+ * {@link #toPickerEndpoints}, as long as both are obtained without an intervening
+ * {@link #updateEndpoints} call. The LB policy relies on that pairing when it builds a
+ * {@link SliceMap} and an {@link AutoShardingPicker} from the same snapshot.
+ *
+ * <p>Note that gRFC A119 derives the index from the position in the resolver's endpoint list
+ * <em>before</em> de-duplication, which can leave gaps when two endpoints share a hostname. We
+ * index after de-duplication instead, so the index is always a valid offset into
+ * {@link #toPickerEndpoints}.
+ *
+ * <h3>Lifecycle</h3>
+ *
+ * <p>gRFC A119 describes building a brand new map on every resolver update. This class instead
+ * keeps one long-lived instance and rebuilds its contents in {@link #updateEndpoints}, which is
+ * the only method that changes the set of endpoints or their indices. Retaining the instance
+ * lets child load balancers — and therefore established connections — survive a resolver update
+ * that merely adds or removes unrelated endpoints.
+ *
+ * <h3>Threading model</h3>
+ *
+ * <p>This class is not thread-safe. Every method must be called from the
+ * {@link SynchronizationContext} of the {@link Helper} supplied at construction. The sole
+ * exception is {@link PickerEndpoint#requestConnection}, reached from RPC threads through the
+ * snapshots returned by {@link #toPickerEndpoints}; it hops onto the synchronization context
+ * before touching any state here.
  */
 @NotThreadSafe
 final class EndpointMap {
-  private final Map<String, EndpointHolder> map = new LinkedHashMap<>();
+  private static final Logger logger = Logger.getLogger(EndpointMap.class.getName());
 
-  @Nullable
-  EndpointHolder get(String hostname) {
-    return map.get(checkNotNull(hostname, "hostname"));
-  }
+  private final Helper helper;
+  private final LoadBalancerProvider childProvider;
+  private final Runnable childStateListener;
 
-  void put(String hostname, EndpointHolder holder) {
-    map.put(checkNotNull(hostname, "hostname"), checkNotNull(holder, "holder"));
-  }
+  // The endpoints, in index order: an endpoint's index is its position here, never stored.
+  // Rebuilt wholesale by updateEndpoints.
+  private final List<EndpointHolder> holders = new ArrayList<>();
 
-  @Nullable
-  EndpointHolder remove(String hostname) {
-    return map.remove(checkNotNull(hostname, "hostname"));
-  }
-
-  Collection<EndpointHolder> values() {
-    return map.values();
-  }
-
-  Set<String> keySet() {
-    return map.keySet();
-  }
-
-  int size() {
-    return map.size();
-  }
-
-  boolean isEmpty() {
-    return map.isEmpty();
-  }
-
-  void clear() {
-    map.clear();
-  }
+  // Hostname to its position in holders. Derived from holders and rebuilt with it; exists so
+  // that translating an assignment's hostnames into indices stays linear in the assignment
+  // size, rather than scanning the endpoints once per name.
+  private final Map<String, Integer> indexByHostname = new HashMap<>();
 
   /**
-   * Re-assigns contiguous 0-based index values across all current endpoint holders.
+   * Set while {@link #updateEndpoints} is running. Children report a state synchronously from
+   * within that method, and forwarding those reports would make the LB policy publish a picker
+   * built from a half-rebuilt map. gRFC A119 avoids this by building a whole new map and
+   * swapping it in; rebuilding in place is what makes the flag necessary.
    */
-  void reindex() {
-    int nextIdx = 0;
-    for (EndpointHolder holder : map.values()) {
-      holder.setIndex(nextIdx++);
-    }
-  }
+  private boolean rebuilding;
 
   /**
-   * Shuts down all child load balancers and clears the map.
-   */
-  void shutdownAll() {
-    for (EndpointHolder holder : map.values()) {
-      holder.shutdown();
-    }
-    map.clear();
-  }
-
-  /**
-   * Builds an immutable snapshot list of {@link PickerEndpoint}s placed strictly at their
-   * corresponding {@link EndpointHolder#getIndex()} positions.
+   * Constructs an empty map.
    *
-   * @throws IllegalStateException if endpoint indices are not contiguous from 0 to N-1
+   * @param helper the parent LB policy's helper, used for its synchronization context and passed
+   *     through to child load balancers
+   * @param childProvider provides the per-endpoint child load balancer, normally {@code
+   *     pick_first}. It is wrapped in a {@link LazyLoadBalancer} here, so the child is not
+   *     instantiated, and therefore does not start connecting, until a pick asks for it
+   * @param childStateListener run after a child reports a new connectivity state or picker.
+   *     Invoked on the synchronization context, never during {@link #updateEndpoints} or after
+   *     {@link #shutdown}
+   */
+  EndpointMap(Helper helper, LoadBalancerProvider childProvider, Runnable childStateListener) {
+    this.helper = checkNotNull(helper, "helper");
+    this.childProvider = checkNotNull(childProvider, "childProvider");
+    this.childStateListener = checkNotNull(childStateListener, "childStateListener");
+  }
+
+  /**
+   * Replaces the set of endpoints, assigning each a new index.
+   *
+   * <p>An endpoint whose hostname appears in both the old and the new set keeps its child load
+   * balancer, along with its connections and last reported state; only its addresses and index
+   * are refreshed. Endpoints that disappear have their child load balancers shut down. New
+   * endpoints start out IDLE with no child load balancer instantiated.
+   *
+   * <p>If several endpoints resolve to the same hostname, the first one wins and the rest are
+   * dropped, as permitted by gRFC A119.
+   *
+   * @param endpoints the endpoints from the resolver, in the order the resolver supplied them
+   * @param attributes the resolver attributes, forwarded to every child load balancer
+   */
+  void updateEndpoints(List<EquivalentAddressGroup> endpoints, Attributes attributes) {
+    Map<String, EquivalentAddressGroup> addressesByHostname = new LinkedHashMap<>();
+    for (EquivalentAddressGroup endpoint : endpoints) {
+      String hostname = hostnameOf(endpoint);
+      if (addressesByHostname.putIfAbsent(hostname, endpoint) != null) {
+        logger.log(Level.FINE, "Dropping duplicate endpoint for hostname {0}", hostname);
+      }
+    }
+
+    // Children of endpoints the resolver no longer reports are shut down and dropped.
+    Map<String, EndpointHolder> survivors = new HashMap<>();
+    for (EndpointHolder holder : holders) {
+      if (addressesByHostname.containsKey(holder.hostname)) {
+        survivors.put(holder.hostname, holder);
+      } else {
+        holder.shutdown();
+      }
+    }
+
+    rebuilding = true;
+    try {
+      holders.clear();
+      indexByHostname.clear();
+      for (Map.Entry<String, EquivalentAddressGroup> entry : addressesByHostname.entrySet()) {
+        String hostname = entry.getKey();
+        EndpointHolder holder = survivors.get(hostname);
+        if (holder == null) {
+          holder = new EndpointHolder(hostname);
+        }
+        indexByHostname.put(hostname, holders.size());
+        holders.add(holder);
+        holder.updateAddresses(entry.getValue(), attributes);
+      }
+    } finally {
+      rebuilding = false;
+    }
+  }
+
+  /** Returns the number of endpoints currently held. */
+  int size() {
+    return holders.size();
+  }
+
+  /**
+   * Returns the index of {@code hostname}, or {@code -1} if no endpoint with that hostname is
+   * currently held. Used to translate the hostnames in an {@link Assignment} into the indices
+   * that {@link SliceMap} and {@link AutoShardingPicker} work with.
+   */
+  int indexOf(String hostname) {
+    Integer index = indexByHostname.get(hostname);
+    return index == null ? -1 : index;
+  }
+
+  /**
+   * Returns an immutable snapshot of the current endpoint states, where element {@code i}
+   * describes the endpoint with index {@code i}.
+   *
+   * <p>The snapshot is safe to hand to a picker running on RPC threads: it captures the
+   * connectivity state and picker by value, and reaches back into this class only through
+   * {@link PickerEndpoint#requestConnection}.
    */
   ImmutableList<PickerEndpoint> toPickerEndpoints() {
-    int size = map.size();
-    if (size == 0) {
-      return ImmutableList.of();
+    ImmutableList.Builder<PickerEndpoint> snapshot =
+        ImmutableList.builderWithExpectedSize(holders.size());
+    for (EndpointHolder holder : holders) {
+      snapshot.add(holder.toPickerEndpoint());
     }
-    PickerEndpoint[] array = new PickerEndpoint[size];
-    for (EndpointHolder holder : map.values()) {
-      int idx = holder.getIndex();
-      checkState(
-          idx >= 0 && idx < size,
-          "Endpoint holder index %s is out of bounds for size %s",
-          idx,
-          size);
-      checkState(
-          array[idx] == null,
-          "Duplicate endpoint holder index %s detected",
-          idx);
-      array[idx] = holder.toPickerEndpoint();
+    return snapshot.build();
+  }
+
+  /**
+   * Returns the aggregated connectivity state to report for the channel, using the {@code
+   * ring_hash} rules from gRFC A42 that gRFC A119 adopts:
+   *
+   * <ol>
+   *   <li>at least one endpoint READY, report READY;
+   *   <li>two or more endpoints TRANSIENT_FAILURE, report TRANSIENT_FAILURE;
+   *   <li>at least one endpoint CONNECTING, report CONNECTING;
+   *   <li>exactly one endpoint TRANSIENT_FAILURE and more than one endpoint, report CONNECTING;
+   *   <li>at least one endpoint IDLE, report IDLE;
+   *   <li>otherwise report TRANSIENT_FAILURE.
+   * </ol>
+   *
+   * <p>An empty map reports TRANSIENT_FAILURE, matching rule 6.
+   */
+  ConnectivityState aggregateConnectivityState() {
+    int connecting = 0;
+    int idle = 0;
+    int transientFailure = 0;
+    for (EndpointHolder holder : holders) {
+      switch (holder.state) {
+        case READY:
+          return READY;
+        case CONNECTING:
+          connecting++;
+          break;
+        case IDLE:
+          idle++;
+          break;
+        case TRANSIENT_FAILURE:
+          transientFailure++;
+          break;
+        default:
+          break;
+      }
     }
-    return ImmutableList.copyOf(array);
+    if (transientFailure >= 2) {
+      return TRANSIENT_FAILURE;
+    }
+    if (connecting > 0) {
+      return CONNECTING;
+    }
+    if (transientFailure == 1 && holders.size() > 1) {
+      return CONNECTING;
+    }
+    if (idle > 0) {
+      return IDLE;
+    }
+    return TRANSIENT_FAILURE;
+  }
+
+  /**
+   * Starts connecting on one IDLE endpoint, unless some endpoint is already CONNECTING or none
+   * is IDLE.
+   *
+   * <p>Because this policy only connects in response to picks, an aggregated state of CONNECTING
+   * or TRANSIENT_FAILURE could otherwise persist with nothing in flight to resolve it. gRFC A119
+   * therefore has the policy nudge a single endpoint after every child state update and resolver
+   * update. Which endpoint is chosen does not matter; this picks the lowest-indexed IDLE one.
+   */
+  void maybeWakeUpIdleEndpoint() {
+    EndpointHolder firstIdle = null;
+    for (EndpointHolder holder : holders) {
+      if (holder.state == CONNECTING) {
+        return;
+      }
+      if (firstIdle == null && holder.state == IDLE) {
+        firstIdle = holder;
+      }
+    }
+    if (firstIdle != null) {
+      firstIdle.requestConnection();
+    }
+  }
+
+  /** Shuts down every child load balancer and empties the map. Idempotent. */
+  void shutdown() {
+    for (EndpointHolder holder : holders) {
+      holder.shutdown();
+    }
+    holders.clear();
+    indexByHostname.clear();
+  }
+
+  /**
+   * Returns the hostname identifying {@code endpoint}. Falls back to the endpoint's first
+   * address when the hostname attribute from gRFC A81 is absent, per gRFC A119.
+   */
+  private static String hostnameOf(EquivalentAddressGroup endpoint) {
+    String hostname = endpoint.getAttributes().get(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME);
+    return hostname != null ? hostname : endpoint.getAddresses().get(0).toString();
   }
 
   @Override
   public String toString() {
-    return MoreObjects.toStringHelper(this)
-        .add("map", map)
-        .toString();
+    return MoreObjects.toStringHelper(this).add("endpoints", holders).toString();
   }
 
   /**
-   * Holds the connectivity state, picker, and lazy child load balancer for a single endpoint.
+   * The child load balancer for a single endpoint, together with the connectivity state and
+   * picker it most recently reported.
    */
-  static final class EndpointHolder {
-    private int index;
+  private final class EndpointHolder {
+    private final String hostname;
     private final LazyLoadBalancer childLb;
-    private final AtomicBoolean connectingScheduled = new AtomicBoolean(false);
-    private final Helper helper;
     private ConnectivityState state = IDLE;
     private SubchannelPicker picker = new FixedResultPicker(PickResult.withNoResult());
+    private boolean childShutdown;
 
-    EndpointHolder(
-        int index,
-        Helper helper,
-        LoadBalancer.Factory pickFirstFactory,
-        @Nullable Runnable stateUpdateCallback) {
-      this.index = index;
-      this.helper = checkNotNull(helper, "helper");
-      this.childLb = new LazyLoadBalancer(
-          new ChildHelper(helper, stateUpdateCallback),
-          checkNotNull(pickFirstFactory, "pickFirstFactory"));
+    EndpointHolder(String hostname) {
+      this.hostname = hostname;
+      this.childLb = new LazyLoadBalancer(new ChildHelper(), childProvider);
     }
 
-    int getIndex() {
-      return index;
-    }
-
-    void setIndex(int index) {
-      this.index = index;
-    }
-
-    ConnectivityState getState() {
-      return state;
-    }
-
-    SubchannelPicker getPicker() {
-      return picker;
-    }
-
-    LazyLoadBalancer getChildLb() {
-      return childLb;
-    }
-
+    /** Captures the current state for use by a picker on RPC threads. */
     PickerEndpoint toPickerEndpoint() {
       return new PickerEndpoint(state, picker, this::exitIdle);
     }
 
-    private void exitIdle() {
-      if (connectingScheduled.compareAndSet(false, true)) {
-        helper.getSynchronizationContext().execute(() -> {
-          connectingScheduled.set(false);
-          childLb.requestConnection();
-        });
+    void updateAddresses(EquivalentAddressGroup endpoint, Attributes attributes) {
+      Status status =
+          childLb.acceptResolvedAddresses(
+              ResolvedAddresses.newBuilder()
+                  .setAddresses(ImmutableList.of(endpoint))
+                  .setAttributes(attributes)
+                  .build());
+      if (!status.isOk()) {
+        // pick_first only rejects an address list it cannot use at all, which should not happen
+        // for the single well-formed endpoint we pass. Report it rather than silently dropping
+        // it; the endpoint simply stays in whatever state it was already in.
+        logger.log(
+            Level.WARNING,
+            "Child load balancer for endpoint {0} rejected its addresses: {1}",
+            new Object[] {hostname, status});
       }
     }
 
-    void updateAddresses(List<EquivalentAddressGroup> eags, Attributes attributes) {
-      ResolvedAddresses childAddresses = ResolvedAddresses.newBuilder()
-          .setAddresses(ImmutableList.copyOf(checkNotNull(eags, "eags")))
-          .setAttributes(checkNotNull(attributes, "attributes"))
-          .build();
-      childLb.acceptResolvedAddresses(childAddresses);
-    }
-
+    /**
+     * Starts connecting if this endpoint is IDLE. Must be called from the synchronization
+     * context.
+     */
     void requestConnection() {
+      if (childShutdown || state != IDLE) {
+        return;
+      }
       childLb.requestConnection();
     }
 
+    /**
+     * The {@link PickerEndpoint.ExitIdler} handed to pickers. Called from RPC threads, so it
+     * hops onto the synchronization context before doing anything.
+     *
+     * <p>The state is re-checked there rather than here, which is what makes repeated calls
+     * harmless: a picker snapshot may be shared by many concurrent RPCs that all observe the
+     * same IDLE endpoint, and the snapshot may outlive the endpoint entirely if a resolver
+     * update removed it in the meantime. By the time the second and later tasks run, either the
+     * child has moved to CONNECTING or the holder has been shut down, and they return early.
+     */
+    private void exitIdle() {
+      helper.getSynchronizationContext().execute(this::requestConnection);
+    }
+
     void shutdown() {
+      if (childShutdown) {
+        return;
+      }
+      childShutdown = true;
       childLb.shutdown();
     }
 
     @Override
     public String toString() {
       return MoreObjects.toStringHelper(this)
-          .add("index", index)
+          .add("hostname", hostname)
           .add("state", state)
-          .add("childLb", childLb)
           .toString();
     }
 
+    /**
+     * Intercepts the child's balancing state so that it is recorded here instead of being
+     * published straight to the channel. The LB policy aggregates across all endpoints and
+     * publishes a single state and picker of its own.
+     */
     private final class ChildHelper extends ForwardingLoadBalancerHelper {
-      private final Helper delegateHelper;
-      @Nullable private final Runnable stateUpdateCallback;
-
-      ChildHelper(Helper delegateHelper, @Nullable Runnable stateUpdateCallback) {
-        this.delegateHelper = checkNotNull(delegateHelper, "delegateHelper");
-        this.stateUpdateCallback = stateUpdateCallback;
-      }
-
       @Override
       protected Helper delegate() {
-        return delegateHelper;
+        return helper;
       }
 
       @Override
       public void updateBalancingState(ConnectivityState newState, SubchannelPicker newPicker) {
-        state = checkNotNull(newState, "newState");
-        picker = checkNotNull(newPicker, "newPicker");
-        if (stateUpdateCallback != null) {
-          stateUpdateCallback.run();
+        if (childShutdown) {
+          return;
         }
-      }
-
-      @Override
-      public String toString() {
-        return MoreObjects.toStringHelper(this)
-            .add("delegateHelper", delegateHelper)
-            .toString();
+        state = newState;
+        picker = newPicker;
+        if (!rebuilding) {
+          childStateListener.run();
+        }
       }
     }
   }
