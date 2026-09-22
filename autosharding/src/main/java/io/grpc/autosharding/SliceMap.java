@@ -28,7 +28,7 @@ import javax.annotation.Nullable;
 /**
  * An immutable lookup structure mapping application routing keys to slice indices.
  *
- * <p>The assignment provider guarantees that the assignment is pre-validated, gap-free,
+ * <p>The assignment provider guarantees that the assignment is pre-validated, gap-free, 
  * non-overlapping, and covers the entire keyspace {@code ["" .. inf)}.
  * <ul>
  *   <li>The first slice's {@code startKey} is expected to be {@code new byte[0]} ({@code ""}).</li>
@@ -45,18 +45,28 @@ import javax.annotation.Nullable;
  *       {@link AutoShardingPicker} to fall back to the fallback pool or fail with UNAVAILABLE.</li>
  *   <li>Key smaller than first slice start key: {@link #lookup(byte[])} returns {@code -1}
  *       if the first slice's {@code startKey} is not {@code ""} and the key precedes it.</li>
+ *   <li>Null key: Treated as an empty byte array ({@code new byte[0]}).</li>
  *   <li>Unsorted slices: The constructor automatically sorts slices lexicographically
  *       using unsigned byte comparison.</li>
+ *   <li>Null constructor arguments: Throws {@link NullPointerException} if {@code slices},
+ *       {@code fallbackPool}, {@code startKey}, or {@code endpoints} is {@code null}.</li>
  * </ul>
  */
 final class SliceMap {
 
-  /** Represents a single key-range slice mapping to endpoint indices in the picker. */
+  /**
+   * Represents a single key-range slice mapping to endpoint indices in the picker.
+   */
   static final class SliceEntry {
     private final byte[] startKey;
     private final ImmutableList<Integer> endpoints;
 
-    /** Constructs an entry starting at the inclusive key {@code startKey}. */
+    /**
+     * Constructs a {@link SliceEntry}.
+     *
+     * @param startKey the inclusive start key of the slice
+     * @param endpoints the list of endpoint indices assigned to this slice
+     */
     SliceEntry(byte[] startKey, List<Integer> endpoints) {
       this.startKey = checkNotNull(startKey, "startKey").clone();
       this.endpoints = ImmutableList.copyOf(checkNotNull(endpoints, "endpoints"));
