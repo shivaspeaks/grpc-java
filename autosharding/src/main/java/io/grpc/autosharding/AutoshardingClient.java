@@ -70,6 +70,13 @@ final class AutoshardingClient {
      * Called with a newly accepted assignment. Invoked on the {@link SynchronizationContext}.
      */
     void onAssignment(Assignment assignment);
+
+    /**
+     * Called when the sharding service sent an assignment that could not be used at all, meaning
+     * every slice in it failed validation. Any assignment already in use remains valid; this
+     * reports that it could not be replaced. Invoked on the {@link SynchronizationContext}.
+     */
+    void onError(Status error);
   }
 
   private final SynchronizationContext syncContext;
@@ -78,15 +85,17 @@ final class AutoshardingClient {
   private final Stopwatch retryStopwatch;
   private final AssignmentWatcher watcher;
   private final String clientUuid;
-
-  @Nullable private Channel channel;
-  @Nullable private String target;
+  private final Channel channel;
+  private final String target;
 
   /**
    * Generation of the most recent accepted assignment. Sent to the server so that it can skip
-   * resending an assignment the client already has. Reset to zero whenever the channel or the
-   * target changes, because the stored value is meaningless against a different sharding server
-   * or a different resource.
+   * resending an assignment the client already has.
+   *
+   * <p>This is why the parent load balancer replaces the whole client when the channel or the
+   * target changes: the stored value is meaningless against a different sharding server or a
+   * different resource, and retaining it could cause the server to withhold assignments
+   * indefinitely.
    */
   private long latestGeneration;
 
@@ -96,8 +105,7 @@ final class AutoshardingClient {
   private boolean shutdown;
 
   /**
-   * Constructs an {@link AutoshardingClient}. No stream is created until
-   * {@link #update(Channel, String)} supplies a channel and a target.
+   * Constructs an {@link AutoshardingClient}. No stream is created until {@link #start()}.
    *
    * @param clientUuid a UUID generated once by the parent load balancer and reused across all
    *     stream restarts
@@ -105,6 +113,9 @@ final class AutoshardingClient {
    * @param timerService used to schedule stream retries
    * @param backoffPolicyProvider supplies the exponential backoff sequence for stream retries
    * @param stopwatchSupplier supplies the stopwatch measuring time spent in a stream attempt
+   * @param channel the channel to the sharding service, created via the "Channel Factory" and
+   *     owned by the parent load balancer
+   * @param target the autosharding target, with any {@code %s} token already substituted
    * @param watcher receives validated assignments
    */
   AutoshardingClient(
@@ -113,41 +124,24 @@ final class AutoshardingClient {
       ScheduledExecutorService timerService,
       BackoffPolicy.Provider backoffPolicyProvider,
       Supplier<Stopwatch> stopwatchSupplier,
+      Channel channel,
+      String target,
       AssignmentWatcher watcher) {
     this.clientUuid = checkNotNull(clientUuid, "clientUuid");
     this.syncContext = checkNotNull(syncContext, "syncContext");
     this.timerService = checkNotNull(timerService, "timerService");
     this.backoffPolicyProvider = checkNotNull(backoffPolicyProvider, "backoffPolicyProvider");
     this.retryStopwatch = checkNotNull(stopwatchSupplier, "stopwatchSupplier").get();
+    this.channel = checkNotNull(channel, "channel");
+    this.target = checkNotNull(target, "target");
     this.watcher = checkNotNull(watcher, "watcher");
   }
 
-  /**
-   * Applies a new channel and/or resolved autosharding target.
-   *
-   * <p>If either changed, any existing stream is torn down, the stored generation number is
-   * discarded, and a new stream is started immediately. A stored generation number is only
-   * meaningful for the combination of sharding server and target that produced it; retaining it
-   * across a change could cause the server to withhold assignments indefinitely.
-   *
-   * @param channel the channel to the sharding service, created via the "Channel Factory"
-   * @param target the autosharding target, with any {@code %s} token already substituted
-   */
-  void update(Channel channel, String target) {
+  /** Opens the {@code WatchShardingAssignment} stream. Call once, on the sync context. */
+  void start() {
     syncContext.throwIfNotInThisSynchronizationContext();
-    checkNotNull(channel, "channel");
-    checkNotNull(target, "target");
-    if (shutdown) {
-      return;
-    }
-    if (channel.equals(this.channel) && target.equals(this.target)) {
-      return;
-    }
-    this.channel = channel;
-    this.target = target;
-    this.latestGeneration = 0;
-    this.retryBackoffPolicy = null;
-    restartStream();
+    checkState(stream == null, "already started");
+    startStream();
   }
 
   /**
@@ -172,17 +166,8 @@ final class AutoshardingClient {
     return latestGeneration;
   }
 
-  private void restartStream() {
-    cancelRetryTimer();
-    if (stream != null) {
-      stream.close(Status.CANCELLED.withDescription("stream restarted"));
-      stream = null;
-    }
-    startStream();
-  }
-
   private void startStream() {
-    if (shutdown || channel == null || target == null) {
+    if (shutdown) {
       return;
     }
     checkState(stream == null, "previous stream has not been cleared yet");
@@ -304,39 +289,52 @@ final class AutoshardingClient {
     /**
      * Reassembles, validates and acknowledges the buffered chunks terminated by an
      * {@code AssignmentMetadata} message.
+     *
+     * <p>Implements the outcome table in gRFC A119, "Handling assignments from the Autosharding
+     * server": every assignment is acknowledged, and only the ones carrying at least one usable
+     * slice reach the load balancer.
      */
     private void handleAssignmentComplete(long generation) {
       List<AssignmentChunk> chunks = new ArrayList<>(bufferedChunks);
       bufferedChunks.clear();
 
-      // Generations are monotonically increasing. Anything we have already seen is stale, and is
-      // dropped without acknowledgement.
+      // Generations are monotonically increasing, so anything we have already accepted is stale.
+      // It is still acknowledged, so that the server does not wait on a reply that never comes.
       if (generation <= latestGeneration) {
-        logger.log(
-            Level.FINE,
-            "Dropping autosharding assignment with stale generation {0}; latest is {1}",
-            new Object[] {generation, latestGeneration});
+        String error =
+            String.format(
+                "stale generation %s; %s has already been accepted", generation, latestGeneration);
+        logger.log(Level.FINE, "Dropping autosharding assignment: {0}", error);
+        sendAck(generation, false, error);
         return;
       }
 
-      Assignment assignment;
-      try {
-        assignment = AssignmentParser.parse(chunks, generation);
-      } catch (AssignmentParser.ValidationException e) {
+      AssignmentParser.Result result = AssignmentParser.parse(chunks, generation);
+      if (result.assignment == null) {
         logger.log(
             Level.WARNING,
-            "Rejecting autosharding assignment with generation {0}: {1}",
-            new Object[] {generation, e.getMessage()});
-        sendAck(generation, false, e.getMessage());
+            "Rejecting autosharding assignment with generation {0}, no usable slices: {1}",
+            new Object[] {generation, result.errorMessage});
+        sendAck(generation, false, result.errorMessage);
+        watcher.onError(
+            Status.UNAVAILABLE.withDescription(
+                "autosharding: no usable slices in assignment with generation "
+                    + generation
+                    + ": "
+                    + result.errorMessage));
         return;
       }
 
-      sendAck(generation, true, null);
-      latestGeneration = generation;
-      if (!receivedGoodAssignment) {
-        receivedGoodAssignment = true;
+      if (result.errorMessage != null) {
+        logger.log(
+            Level.WARNING,
+            "Accepting autosharding assignment with generation {0} after dropping slices: {1}",
+            new Object[] {generation, result.errorMessage});
       }
-      watcher.onAssignment(assignment);
+      sendAck(generation, true, result.errorMessage);
+      latestGeneration = generation;
+      receivedGoodAssignment = true;
+      watcher.onAssignment(result.assignment);
     }
 
     private void sendAck(long generation, boolean accepted, @Nullable String errorMessage) {

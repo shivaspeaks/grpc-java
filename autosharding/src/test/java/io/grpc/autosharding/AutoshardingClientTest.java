@@ -38,6 +38,8 @@ import io.grpc.internal.BackoffPolicy;
 import io.grpc.internal.FakeClock;
 import io.grpc.stub.StreamObserver;
 import io.grpc.testing.GrpcCleanupRule;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -69,44 +71,35 @@ public class AutoshardingClientTest {
   private final FakeClock fakeClock = new FakeClock();
   private final FakeAutoshardingService service = new FakeAutoshardingService();
   private final BlockingQueue<Assignment> assignments = new LinkedBlockingQueue<>();
+  private final BlockingQueue<Status> errors = new LinkedBlockingQueue<>();
   private final RecordingBackoffPolicyProvider backoffPolicyProvider =
       new RecordingBackoffPolicyProvider();
+  private final List<AutoshardingClient> clients = new ArrayList<>();
 
   private Channel channel;
   private AutoshardingClient client;
 
   @Before
   public void setUp() throws Exception {
-    String serverName = InProcessServerBuilder.generateName();
-    grpcCleanup.register(
-        InProcessServerBuilder.forName(serverName)
-            .directExecutor()
-            .addService(service)
-            .build()
-            .start());
-    channel =
-        grpcCleanup.register(
-            InProcessChannelBuilder.forName(serverName).directExecutor().build());
-    client =
-        new AutoshardingClient(
-            CLIENT_UUID,
-            syncContext,
-            fakeClock.getScheduledExecutorService(),
-            backoffPolicyProvider,
-            fakeClock.getStopwatchSupplier(),
-            assignments::add);
+    channel = newChannelToFakeService();
+    client = newClient(channel, TARGET);
   }
 
   @After
   public void tearDown() {
-    // Must happen before GrpcCleanupRule shuts the channel down, otherwise the client keeps
+    // Must happen before GrpcCleanupRule shuts the channels down, otherwise a client keeps
     // retrying against a terminating channel.
-    syncContext.execute(client::shutdown);
+    syncContext.execute(
+        () -> {
+          for (AutoshardingClient created : clients) {
+            created.shutdown();
+          }
+        });
   }
 
   @Test
-  public void update_startsStreamAndSendsInitialClientConfig() throws Exception {
-    update(channel, TARGET);
+  public void start_opensStreamAndSendsInitialClientConfig() throws Exception {
+    start(client);
 
     WatchShardingAssignmentRequest request = takeRequest();
     assertThat(request.hasInitialClientConfig()).isTrue();
@@ -116,18 +109,8 @@ public class AutoshardingClientTest {
   }
 
   @Test
-  public void update_unchanged_doesNotRestartStream() throws Exception {
-    update(channel, TARGET);
-    takeRequest();
-
-    update(channel, TARGET);
-
-    assertThat(service.streamCount.get()).isEqualTo(1);
-  }
-
-  @Test
   public void chunksBufferedUntilMetadata_thenAssignmentDeliveredAndAcked() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -151,7 +134,7 @@ public class AutoshardingClientTest {
 
   @Test
   public void multipleChunks_combinedIntoOneLogicalAssignment() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -171,12 +154,13 @@ public class AutoshardingClientTest {
   }
 
   @Test
-  public void invalidAssignment_nackedAndNotDelivered() throws Exception {
-    update(channel, TARGET);
+  public void noUsableSlices_nackedAndReportedAsAnError() throws Exception {
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
-    // Endpoint index 3 does not exist in the combined endpoint list.
+    // Endpoint index 3 does not exist in the combined endpoint list, so the only slice is
+    // dropped and nothing usable remains.
     serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 3)));
     serverStream.onNext(metadataResponse(5));
 
@@ -186,19 +170,51 @@ public class AutoshardingClientTest {
     assertThat(nack.getAssignmentAck().getAccepted()).isFalse();
     assertThat(nack.getAssignmentAck().getErrorMessage())
         .contains("out-of-range endpoint index 3");
+    assertThat(takeError().getDescription()).contains("out-of-range endpoint index 3");
     assertThat(assignments).isEmpty();
+    // A rejected assignment must not advance the watermark, or the server would stop resending.
     assertThat(client.getLatestGeneration()).isEqualTo(0);
   }
 
   @Test
-  public void invalidAssignment_doesNotLeakChunksIntoNextAssignment() throws Exception {
-    update(channel, TARGET);
+  public void someSlicesDropped_ackedWithErrorMessageAndStillDelivered() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+
+    serverStream.onNext(
+        chunkResponse(
+            AssignmentChunk.newBuilder()
+                .addEndpoints(endpoint("host-a"))
+                .addSliceAssignments(sliceAssignment("", "m", 0))
+                .addSliceAssignments(sliceAssignment("m", null, 3))
+                .build()));
+    serverStream.onNext(metadataResponse(5));
+
+    Assignment assignment = takeAssignment();
+    assertThat(assignment.getSlices()).hasSize(2);
+    assertThat(assignment.getSlices().get(0).getEndpoints()).containsExactly(0);
+    // The dropped slice was turned into a gap rather than invalidating the assignment.
+    assertThat(assignment.getSlices().get(1).getEndpoints()).isEmpty();
+
+    WatchShardingAssignmentRequest ack = takeRequest();
+    assertThat(ack.getAssignmentAck().getAccepted()).isTrue();
+    assertThat(ack.getAssignmentAck().getErrorMessage())
+        .contains("out-of-range endpoint index 3");
+    assertThat(errors).isEmpty();
+    assertThat(client.getLatestGeneration()).isEqualTo(5);
+  }
+
+  @Test
+  public void rejectedAssignment_doesNotLeakChunksIntoTheNextOne() throws Exception {
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
     serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 3)));
     serverStream.onNext(metadataResponse(5));
     takeRequest(); // NACK
+    takeError();
 
     serverStream.onNext(chunkResponse(chunkWithEndpoint("host-b", "", null, 0)));
     serverStream.onNext(metadataResponse(6));
@@ -208,8 +224,8 @@ public class AutoshardingClientTest {
   }
 
   @Test
-  public void staleGeneration_droppedWithoutAck() throws Exception {
-    update(channel, TARGET);
+  public void staleGeneration_nackedAndNotDelivered() throws Exception {
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -221,14 +237,19 @@ public class AutoshardingClientTest {
     serverStream.onNext(chunkResponse(chunkWithEndpoint("host-b", "", null, 0)));
     serverStream.onNext(metadataResponse(5));
 
+    WatchShardingAssignmentRequest nack = takeRequest();
+    assertThat(nack.getAssignmentAck().getGeneration()).isEqualTo(5);
+    assertThat(nack.getAssignmentAck().getAccepted()).isFalse();
+    assertThat(nack.getAssignmentAck().getErrorMessage()).contains("stale generation");
+    // A stale assignment tells the LB policy nothing it does not already know.
     assertThat(assignments).isEmpty();
-    assertThat(service.requests).isEmpty();
+    assertThat(errors).isEmpty();
     assertThat(client.getLatestGeneration()).isEqualTo(5);
   }
 
   @Test
-  public void olderGeneration_droppedWithoutAck() throws Exception {
-    update(channel, TARGET);
+  public void olderGeneration_nackedAndNotDelivered() throws Exception {
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -240,13 +261,16 @@ public class AutoshardingClientTest {
     serverStream.onNext(chunkResponse(chunkWithEndpoint("host-b", "", null, 0)));
     serverStream.onNext(metadataResponse(4));
 
+    WatchShardingAssignmentRequest nack = takeRequest();
+    assertThat(nack.getAssignmentAck().getGeneration()).isEqualTo(4);
+    assertThat(nack.getAssignmentAck().getAccepted()).isFalse();
     assertThat(assignments).isEmpty();
-    assertThat(service.requests).isEmpty();
+    assertThat(client.getLatestGeneration()).isEqualTo(5);
   }
 
   @Test
   public void loadReportingConfig_ignored() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -261,7 +285,7 @@ public class AutoshardingClientTest {
 
   @Test
   public void streamFailure_reconnectsAndSendsLatestGeneration() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -282,7 +306,7 @@ public class AutoshardingClientTest {
 
   @Test
   public void streamFailure_doesNotReconnectBeforeBackoffElapses() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
 
     takeServerStream().onError(Status.UNAVAILABLE.asRuntimeException());
@@ -298,7 +322,7 @@ public class AutoshardingClientTest {
 
   @Test
   public void streamCompletedByServer_reconnects() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
 
@@ -311,7 +335,7 @@ public class AutoshardingClientTest {
 
   @Test
   public void backoffSequence_onlyResetAfterGoodAssignment() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
 
     // First failure with no assignment received: a backoff sequence is created.
@@ -338,9 +362,14 @@ public class AutoshardingClientTest {
     assertThat(backoffPolicyProvider.timesCalled).isEqualTo(2);
   }
 
+  /**
+   * The LB policy answers a target or channel change by replacing the client rather than by
+   * updating it, so the accepted-generation watermark never crosses over to a different server or
+   * resource. See gRFC A119, "Communicating with the Autosharding service".
+   */
   @Test
-  public void targetChange_restartsStreamAndResetsGeneration() throws Exception {
-    update(channel, TARGET);
+  public void newClient_startsFromGenerationZero() throws Exception {
+    start(client);
     takeRequest();
     StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
     serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
@@ -348,48 +377,22 @@ public class AutoshardingClientTest {
     takeAssignment();
     takeRequest(); // ACK
     assertThat(client.getLatestGeneration()).isEqualTo(9);
+    syncContext.execute(client::shutdown);
 
-    update(channel, OTHER_TARGET);
+    AutoshardingClient replacement = newClient(newChannelToFakeService(), OTHER_TARGET);
+    start(replacement);
 
     WatchShardingAssignmentRequest request = takeRequest();
     assertThat(request.hasInitialClientConfig()).isTrue();
     assertThat(request.getInitialClientConfig().getTarget()).isEqualTo(OTHER_TARGET);
     assertThat(request.getInitialClientConfig().getLatestGeneration()).isEqualTo(0);
-    assertThat(client.getLatestGeneration()).isEqualTo(0);
-    assertThat(service.streamCount.get()).isEqualTo(2);
-  }
-
-  @Test
-  public void channelChange_restartsStreamAndResetsGeneration() throws Exception {
-    update(channel, TARGET);
-    takeRequest();
-    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
-    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
-    serverStream.onNext(metadataResponse(9));
-    takeAssignment();
-    takeRequest(); // ACK
-
-    String otherServerName = InProcessServerBuilder.generateName();
-    grpcCleanup.register(
-        InProcessServerBuilder.forName(otherServerName)
-            .directExecutor()
-            .addService(service)
-            .build()
-            .start());
-    Channel otherChannel =
-        grpcCleanup.register(
-            InProcessChannelBuilder.forName(otherServerName).directExecutor().build());
-
-    update(otherChannel, TARGET);
-
-    WatchShardingAssignmentRequest request = takeRequest();
-    assertThat(request.getInitialClientConfig().getLatestGeneration()).isEqualTo(0);
+    assertThat(replacement.getLatestGeneration()).isEqualTo(0);
     assertThat(service.streamCount.get()).isEqualTo(2);
   }
 
   @Test
   public void shutdown_cancelsStreamAndStopsReconnecting() throws Exception {
-    update(channel, TARGET);
+    start(client);
     takeRequest();
 
     syncContext.execute(client::shutdown);
@@ -399,19 +402,54 @@ public class AutoshardingClientTest {
   }
 
   @Test
-  public void shutdown_isIdempotentAndIgnoresLaterUpdates() throws Exception {
-    update(channel, TARGET);
+  public void shutdown_isIdempotent() throws Exception {
+    start(client);
     takeRequest();
 
     syncContext.execute(client::shutdown);
     syncContext.execute(client::shutdown);
-    update(channel, OTHER_TARGET);
 
     assertThat(service.streamCount.get()).isEqualTo(1);
   }
 
-  private void update(Channel channel, String target) {
-    syncContext.execute(() -> client.update(channel, target));
+  @Test
+  public void shutdown_beforeStart_leavesNothingBehind() {
+    syncContext.execute(client::shutdown);
+
+    assertThat(service.streamCount.get()).isEqualTo(0);
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+  }
+
+  private Channel newChannelToFakeService() throws Exception {
+    String serverName = InProcessServerBuilder.generateName();
+    grpcCleanup.register(
+        InProcessServerBuilder.forName(serverName)
+            .directExecutor()
+            .addService(service)
+            .build()
+            .start());
+    return grpcCleanup.register(
+        InProcessChannelBuilder.forName(serverName).directExecutor().build());
+  }
+
+  /** Creates a client and registers it for shutdown, without starting it. */
+  private AutoshardingClient newClient(Channel channel, String target) {
+    AutoshardingClient created =
+        new AutoshardingClient(
+            CLIENT_UUID,
+            syncContext,
+            fakeClock.getScheduledExecutorService(),
+            backoffPolicyProvider,
+            fakeClock.getStopwatchSupplier(),
+            channel,
+            target,
+            new RecordingWatcher());
+    clients.add(created);
+    return created;
+  }
+
+  private void start(AutoshardingClient target) {
+    syncContext.execute(target::start);
   }
 
   /** Asserts that a retry was scheduled and advances the clock so that it runs. */
@@ -444,6 +482,14 @@ public class AutoshardingClientTest {
       fail("timed out waiting for an assignment");
     }
     return assignment;
+  }
+
+  private Status takeError() throws Exception {
+    Status error = errors.poll(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    if (error == null) {
+      fail("timed out waiting for an error");
+    }
+    return error;
   }
 
   private static WatchShardingAssignmentResponse chunkResponse(AssignmentChunk chunk) {
@@ -481,6 +527,18 @@ public class AutoshardingClientTest {
       builder.addEndpoints(PerSliceEndpointState.newBuilder().setEndpointIndex(index));
     }
     return builder.build();
+  }
+
+  private final class RecordingWatcher implements AutoshardingClient.AssignmentWatcher {
+    @Override
+    public void onAssignment(Assignment assignment) {
+      assignments.add(assignment);
+    }
+
+    @Override
+    public void onError(Status error) {
+      errors.add(error);
+    }
   }
 
   private static final class FakeAutoshardingService

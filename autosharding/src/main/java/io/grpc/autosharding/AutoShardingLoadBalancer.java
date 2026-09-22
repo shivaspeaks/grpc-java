@@ -69,10 +69,11 @@ import javax.annotation.Nullable;
  *
  * <h3>Startup</h3>
  *
- * <p>Creating a channel to the sharding service starts the initial assignment timer. Until the
- * first assignment arrives or that timer fires, RPCs are queued. Once the timer fires without an
+ * <p>Creating an {@link AutoshardingClient} starts the initial assignment timer. Until the first
+ * assignment arrives or that timer fires, RPCs are queued. Once the timer fires without an
  * assignment, RPCs either spread across every resolved endpoint or fail outright, depending on
- * {@code enable_fallback}. An assignment carried over from a previous channel keeps being used
+ * {@code enable_fallback}. A new client is created whenever the channel factory key or the
+ * sharding target changes; an assignment carried over from the previous client keeps being used
  * while the timer runs, so a change of sharding service does not interrupt traffic.
  *
  * <h3>Threading model</h3>
@@ -113,6 +114,13 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
   /** Channel borrowed from {@link #channelFactory}; must be given back when we are done. */
   @Nullable private Channel shardingChannel;
 
+  /**
+   * The {@code autosharding_target} the current {@link #client} was created with, after {@code %s}
+   * substitution. Tracked separately from the config because the substitution depends on the
+   * resolved endpoints, so the target can change while the config does not.
+   */
+  @Nullable private String shardingTarget;
+
   @Nullable private AutoshardingClient client;
 
   /** Most recent assignment accepted from the sharding service, retained across reconnects. */
@@ -124,8 +132,8 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
   @Nullable private ScheduledHandle initialAssignmentTimer;
 
   /**
-   * True from the moment a channel to the sharding service is created until either an assignment
-   * arrives on it or {@link #initialAssignmentTimer} fires. Combined with a null
+   * True from the moment an {@link AutoshardingClient} is created until either an assignment
+   * arrives from it or {@link #initialAssignmentTimer} fires. Combined with a null
    * {@link #assignment} it means RPCs must be queued rather than failed.
    */
   private boolean awaitingInitialAssignment;
@@ -191,6 +199,7 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       return failPermanently("autosharding: name resolver returned no endpoints");
     }
 
+    Channel previousChannel = shardingChannel;
     Status channelStatus = updateShardingServiceChannel(factory, newConfig);
     if (!channelStatus.isOk()) {
       return channelStatus;
@@ -203,9 +212,11 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
 
     endpointMap.updateEndpoints(endpoints, resolvedAddresses.getAttributes());
 
-    // Safe to call on every update: the client compares against what it already has and only
-    // restarts the stream when the channel or the target actually changed.
-    client.update(shardingChannel, resolveTarget(newConfig, endpoints));
+    // The target is resolved against the endpoints, so it can change even when the config did not.
+    maybeRecreateClient(
+        shardingChannel != previousChannel,
+        resolveTarget(newConfig, endpoints),
+        newConfig.initialAssignmentTimeoutNanos);
 
     rebuildSliceMapAndPublish();
     return Status.OK;
@@ -246,6 +257,7 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       client.shutdown();
       client = null;
     }
+    shardingTarget = null;
     if (shardingChannel != null) {
       channelFactory.releaseChannel(shardingChannel);
       shardingChannel = null;
@@ -256,8 +268,9 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
 
   /**
    * Creates a channel to the sharding service if this is the first configuration update, or if
-   * the key or the factory changed. Doing so also restarts the initial assignment timer, per
-   * gRFC A119.
+   * the {@code channel_factory_key} or the factory itself changed. Leaves {@link #shardingChannel}
+   * untouched when nothing changed, which is how the caller detects that no new channel was
+   * needed.
    */
   private Status updateShardingServiceChannel(
       ChannelFactory factory, AutoShardingLoadBalancerConfig newConfig) {
@@ -285,19 +298,43 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     }
     shardingChannel = newChannel;
     channelFactory = factory;
-
-    if (client == null) {
-      client =
-          new AutoshardingClient(
-              clientUuid,
-              syncContext,
-              timeService,
-              backoffPolicyProvider,
-              stopwatchSupplier,
-              this::onAssignment);
-    }
-    startInitialAssignmentTimer(newConfig.initialAssignmentTimeoutNanos);
     return Status.OK;
+  }
+
+  /**
+   * Replaces the {@link AutoshardingClient} when there is none yet, or when the channel to the
+   * sharding service or the resolved target changed.
+   *
+   * <p>gRFC A119 calls for a new client rather than an in-place update because the client's
+   * accepted-generation watermark is only meaningful against the server and the resource it was
+   * learned from; carrying it over could make a different server withhold assignments
+   * indefinitely.
+   *
+   * <p>Creating a client also restarts the initial assignment timer, since the new one has to
+   * start from scratch. Any assignment carried over from the previous client keeps being served
+   * while that timer runs.
+   */
+  private void maybeRecreateClient(boolean channelChanged, String newTarget, long timeoutNanos) {
+    if (client != null && !channelChanged && newTarget.equals(shardingTarget)) {
+      return;
+    }
+    if (client != null) {
+      client.shutdown();
+    }
+    shardingTarget = newTarget;
+    client =
+        new AutoshardingClient(
+            clientUuid,
+            syncContext,
+            timeService,
+            backoffPolicyProvider,
+            stopwatchSupplier,
+            shardingChannel,
+            newTarget,
+            new AssignmentWatcherImpl());
+    // Armed before the stream opens so that an assignment delivered right away cancels it.
+    startInitialAssignmentTimer(timeoutNanos);
+    client.start();
   }
 
   /**
@@ -346,14 +383,44 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     rebuildSliceMapAndPublish();
   }
 
-  /** Called by {@link AutoshardingClient} on the synchronization context. */
-  private void onAssignment(Assignment newAssignment) {
-    if (shutdown) {
-      return;
+  /**
+   * Receives assignments from the current {@link AutoshardingClient}. Both callbacks arrive on
+   * the synchronization context.
+   *
+   * <p>A client that has been replaced cannot deliver anything, because {@link
+   * AutoshardingClient#shutdown()} closes its stream, so there is no need to check which client a
+   * callback came from.
+   */
+  private final class AssignmentWatcherImpl implements AutoshardingClient.AssignmentWatcher {
+    @Override
+    public void onAssignment(Assignment newAssignment) {
+      if (shutdown) {
+        return;
+      }
+      assignment = newAssignment;
+      cancelInitialAssignmentTimer();
+      rebuildSliceMapAndPublish();
     }
-    assignment = newAssignment;
-    cancelInitialAssignmentTimer();
-    rebuildSliceMapAndPublish();
+
+    @Override
+    public void onError(Status error) {
+      if (shutdown) {
+        return;
+      }
+      if (assignment != null) {
+        // An assignment we can still use is in hand; the service only failed to replace it.
+        // Mirrors handleNameResolutionError: stale data beats no data.
+        logger.log(Level.WARNING, "Keeping the current sharding assignment: {0}", error);
+        return;
+      }
+      logger.log(
+          Level.WARNING,
+          "The sharding service sent no usable assignment; proceeding {0} fallback: {1}",
+          new Object[] {config != null && config.enableFallback ? "with" : "without", error});
+      // Stop queuing RPCs: there is nothing left to wait for on this generation.
+      cancelInitialAssignmentTimer();
+      rebuildSliceMapAndPublish();
+    }
   }
 
   /**

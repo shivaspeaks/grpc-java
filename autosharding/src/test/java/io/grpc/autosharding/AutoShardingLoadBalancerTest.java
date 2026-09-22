@@ -265,10 +265,7 @@ public class AutoShardingLoadBalancerTest {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
     takeRequest();
 
-    AutoShardingLoadBalancerConfig retargeted =
-        new AutoShardingLoadBalancerConfig(
-            CHANNEL_FACTORY_KEY, "other-target", KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
-    deliverAddresses(retargeted, "a");
+    deliverAddresses(retargetedConfig("other-target"), "a");
 
     assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
     assertThat(service.streamCount.get()).isEqualTo(2);
@@ -277,22 +274,11 @@ public class AutoShardingLoadBalancerTest {
 
   @Test
   public void targetWithLocalityToken_isSubstituted() throws Exception {
-    AutoShardingLoadBalancerConfig localityConfig =
-        new AutoShardingLoadBalancerConfig(
-            CHANNEL_FACTORY_KEY, "target/%s", KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
-    EquivalentAddressGroup endpoint =
-        new EquivalentAddressGroup(
-            new NamedAddress("addr-a"),
-            Attributes.newBuilder()
-                .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, "a")
-                .set(EquivalentAddressGroup.ATTR_LOCALITY_NAME, "us-central1-a")
-                .build());
-
     acceptAddresses(
         ResolvedAddresses.newBuilder()
-            .setAddresses(ImmutableList.of(endpoint))
+            .setAddresses(ImmutableList.of(endpointInLocality("a", "us-central1-a")))
             .setAttributes(attributesWithChannelFactory())
-            .setLoadBalancingPolicyConfig(localityConfig)
+            .setLoadBalancingPolicyConfig(retargetedConfig("target/%s"))
             .build());
 
     assertThat(takeRequest().getInitialClientConfig().getTarget())
@@ -300,12 +286,32 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
-  public void targetWithLocalityToken_noLocality_substitutesEmptyString() throws Exception {
-    AutoShardingLoadBalancerConfig localityConfig =
-        new AutoShardingLoadBalancerConfig(
-            CHANNEL_FACTORY_KEY, "target/%s", KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
+  public void changedLocality_createsANewClientEvenThoughTheConfigIsUnchanged() throws Exception {
+    AutoShardingLoadBalancerConfig localityConfig = retargetedConfig("target/%s");
+    acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(ImmutableList.of(endpointInLocality("a", "us-central1-a")))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(localityConfig)
+            .build());
+    takeRequest();
 
-    deliverAddresses(localityConfig, "a");
+    acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(ImmutableList.of(endpointInLocality("a", "us-central1-b")))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(localityConfig)
+            .build());
+
+    assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
+    assertThat(service.streamCount.get()).isEqualTo(2);
+    assertThat(takeRequest().getInitialClientConfig().getTarget())
+        .isEqualTo("target/us-central1-b");
+  }
+
+  @Test
+  public void targetWithLocalityToken_noLocality_substitutesEmptyString() throws Exception {
+    deliverAddresses(retargetedConfig("target/%s"), "a");
 
     assertThat(takeRequest().getInitialClientConfig().getTarget()).isEqualTo("target/");
   }
@@ -383,6 +389,59 @@ public class AutoShardingLoadBalancerTest {
 
     assertThat(pickedHost(pick("z"))).isEqualTo("b");
     assertThat(pickedHost(pick("a"))).isEqualTo("a");
+  }
+
+  @Test
+  public void newClient_restartsTheInitialAssignmentTimer() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "a"));
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+
+    deliverAddresses(retargetedConfig("other-target"), "a");
+
+    // The replacement client has to learn an assignment from scratch, so it gets the full
+    // timeout rather than inheriting the exhausted one.
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+  }
+
+  @Test
+  public void unusableAssignment_beforeAnyAssignment_stopsQueuingAndFallsBack() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    reportReady("a");
+    reportReady("b");
+    assertThat(currentState).isEqualTo(CONNECTING);
+
+    pushUnusableAssignment(1);
+
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+  }
+
+  @Test
+  public void unusableAssignment_beforeAnyAssignment_fallbackDisabled_failsRpcs()
+      throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+    reportReady("a");
+
+    pushUnusableAssignment(1);
+
+    PickResult result = pick("k");
+    assertThat(result.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(result.getStatus().getDescription()).contains("fallback disabled");
+  }
+
+  @Test
+  public void unusableAssignment_afterAGoodOne_keepsServingTheGoodOne() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    deliverAssignment(1, slice("", "a"), slice("m", "b"));
+    reportReady("a");
+    reportReady("b");
+
+    pushUnusableAssignment(2);
+
+    assertThat(pickedHost(pick("alpha"))).isEqualTo("a");
+    assertThat(pickedHost(pick("zulu"))).isEqualTo("b");
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -598,6 +657,12 @@ public class AutoShardingLoadBalancerTest {
         channelFactoryKey, TARGET, KEY_HEADER, enableFallback, ASSIGNMENT_TIMEOUT_NANOS);
   }
 
+  /** The default config with a different {@code autosharding_target}. */
+  private AutoShardingLoadBalancerConfig retargetedConfig(String target) {
+    return new AutoShardingLoadBalancerConfig(
+        CHANNEL_FACTORY_KEY, target, KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
+  }
+
   private Attributes attributesWithChannelFactory() {
     return Attributes.newBuilder()
         .set(AutoShardingAttributes.ATTR_CHANNEL_FACTORY, channelFactory)
@@ -632,9 +697,38 @@ public class AutoShardingLoadBalancerTest {
     return ImmutableList.copyOf(eags);
   }
 
+  private static EquivalentAddressGroup endpointInLocality(String hostname, String locality) {
+    return new EquivalentAddressGroup(
+        new NamedAddress("addr-" + hostname),
+        Attributes.newBuilder()
+            .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, hostname)
+            .set(EquivalentAddressGroup.ATTR_LOCALITY_NAME, locality)
+            .build());
+  }
+
   /** Sends an assignment from the fake service and waits for the load balancer to apply it. */
   private void deliverAssignment(long generation, SliceSpec... slices) throws Exception {
     pushAssignment(generation, slices);
+  }
+
+  /**
+   * Sends an assignment whose only slice fails validation. Nothing usable remains, so the client
+   * reports an error to the load balancer instead of an assignment.
+   */
+  private void pushUnusableAssignment(long generation) throws Exception {
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = currentServerStream();
+    serverStream.onNext(
+        WatchShardingAssignmentResponse.newBuilder()
+            .setChunk(
+                AssignmentChunk.newBuilder()
+                    .addEndpoints(EndpointState.newBuilder().setEndpoint("a"))
+                    // Index 7 is past the end of the endpoint list above.
+                    .addSliceAssignments(sliceAssignment("", null, 7)))
+            .build());
+    serverStream.onNext(
+        WatchShardingAssignmentResponse.newBuilder()
+            .setMetadata(AssignmentMetadata.newBuilder().setGeneration(generation))
+            .build());
   }
 
   private void pushAssignment(long generation, SliceSpec... slices) throws Exception {
