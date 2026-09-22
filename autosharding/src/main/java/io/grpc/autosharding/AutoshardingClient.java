@@ -65,13 +65,9 @@ final class AutoshardingClient {
   /** The limit {@code autosharding.proto} places on {@code AssignmentAck.error_message}. */
   private static final int MAX_ERROR_MESSAGE_CODE_POINTS = 512;
 
-  /**
-   * Receives validated assignments from the autosharding service.
-   */
+  /** Receives validated assignments from the autosharding service. */
   interface AssignmentWatcher {
-    /**
-     * Called with a newly accepted assignment. Invoked on the {@link SynchronizationContext}.
-     */
+    /** Called with a newly accepted assignment. Invoked on the sync context. */
     void onAssignment(Assignment assignment);
 
     /**
@@ -212,9 +208,7 @@ final class AutoshardingClient {
         syncContext.schedule(this::startStream, delayNanos, TimeUnit.NANOSECONDS, timerService);
   }
 
-  /**
-   * A single {@code WatchShardingAssignment} stream.
-   */
+  /** A single {@code WatchShardingAssignment} stream. */
   private final class AutoshardingStream
       implements ClientResponseObserver<
           WatchShardingAssignmentRequest, WatchShardingAssignmentResponse> {

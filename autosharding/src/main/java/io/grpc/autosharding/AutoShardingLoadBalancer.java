@@ -341,12 +341,9 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
    * Substitutes the optional {@code %s} token in the configured target with the locality of the
    * resolved endpoints, or with the empty string when no locality is available.
    *
-   * <p>The locality is read from {@link EquivalentAddressGroup#ATTR_LOCALITY_NAME}, which is a
-   * plain {@code io.grpc} attribute rather than an xDS-specific one. That keeps a single code path
-   * for both deployments: under xDS the attribute is populated by the cluster resolver, and
-   * without xDS gRFC A119 makes it the user's responsibility to have their name resolver populate
-   * it if their target contains a {@code %s} token. All endpoints handed to one instance of this
-   * policy belong to the same locality, so the first one is representative.
+   * <p>{@link EquivalentAddressGroup#ATTR_LOCALITY_NAME} is preferred over an xDS-specific
+   * attribute so that a plain name resolver can supply it too, which is what gRFC A119 asks of
+   * non-xDS users. All endpoints reaching one instance of this policy share a locality.
    */
   private static String resolveTarget(
       AutoShardingLoadBalancerConfig config, List<EquivalentAddressGroup> endpoints) {

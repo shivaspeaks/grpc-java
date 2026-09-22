@@ -46,9 +46,7 @@ import javax.annotation.concurrent.Immutable;
 @Immutable
 final class Assignment {
 
-  /**
-   * A single contiguous key range and the endpoints assigned to it.
-   */
+  /** A single contiguous key range and the endpoints assigned to it. */
   @Immutable
   @SuppressWarnings("Immutable") // Defensive copies are made; arrays are never mutated.
   static final class Slice {
