@@ -81,8 +81,19 @@ final class AssignmentParser {
     }
   }
 
-  /** At most this many dropped slices are named in {@link Result#errorMessage}. */
-  private static final int MAX_REPORTED_PROBLEMS = 3;
+  /**
+   * The limit on {@code AssignmentAck.error_message}, from {@code autosharding.proto}: "The
+   * length of this field MUST NOT exceed 512 characters".
+   */
+  private static final int MAX_ERROR_MESSAGE_CHARS = 512;
+
+  /**
+   * How much of a key to hex-encode into a description. Keys may be up to 512 bytes, and only
+   * the leading bytes are needed to tell one slice from another in a log.
+   */
+  private static final int MAX_ENCODED_KEY_BYTES = 8;
+
+  private static final String SEPARATOR = "; ";
 
   private static final Comparator<byte[]> UNSIGNED_BYTES_COMPARATOR =
       UnsignedBytes.lexicographicalComparator();
@@ -160,10 +171,18 @@ final class AssignmentParser {
             continue;
           }
           if (keyOrder == 0) {
-            // Permitted by the gRFC's "start_key <= end_key" rule, but it covers no keys and
-            // would put two entries with the same start key in the SliceMap, which makes the
-            // picker's binary search ambiguous. Dropping it leaves no gap: its neighbours
-            // already meet at this key.
+            // Satisfies the gRFC's "start_key <= end_key", but end_key is exclusive, so
+            // [k, k) is the empty range rather than the single key k. A server wanting to
+            // assign one key sends [k, k+1), i.e. an end_key of k with a trailing 0x00.
+            //
+            // Keeping it would put a second entry with the same start key in the SliceMap,
+            // and the picker resolves a key by binary search over start keys, so a key equal
+            // to this one could resolve to either entry. Any endpoints on it are no loss:
+            // no key can fall in an empty range, so they were unreachable through it anyway,
+            // and the assignment's endpoint list is built from the chunks, not from slices.
+            //
+            // Nor can dropping it open a gap -- it covered nothing -- so the gap-filling pass
+            // below produces the same coverage with or without it.
             dropped.add(
                 String.format("slice [%s, %s) is empty", encode(startKey), encode(endKey)));
             continue;
@@ -256,16 +275,54 @@ final class AssignmentParser {
     return filled;
   }
 
-  /** Summarizes the dropped slices, capped so that the ack stays a reasonable size. */
+  /**
+   * Summarizes the dropped slices, reporting as many as the {@code error_message} budget of an
+   * {@code AssignmentAck} allows and naming the count of those left out.
+   *
+   * <p>The result is sized to fit within {@link #MAX_ERROR_MESSAGE_CHARS} so that
+   * {@code AutoshardingClient}'s final truncation never has to cut a description in half.
+   */
   private static String describe(List<String> dropped) {
-    if (dropped.size() <= MAX_REPORTED_PROBLEMS) {
-      return String.join("; ", dropped);
+    StringBuilder message = new StringBuilder();
+    int reported = 0;
+    for (String problem : dropped) {
+      int separator = reported == 0 ? 0 : SEPARATOR.length();
+      // Leave room for the suffix that will be needed if this is where we stop.
+      int reserved = andMore(dropped.size() - reported - 1).length();
+      if (message.length() + separator + problem.length() + reserved
+          > MAX_ERROR_MESSAGE_CHARS) {
+        break;
+      }
+      if (reported > 0) {
+        message.append(SEPARATOR);
+      }
+      message.append(problem);
+      reported++;
     }
-    return String.join("; ", dropped.subList(0, MAX_REPORTED_PROBLEMS))
-        + String.format("; and %s more", dropped.size() - MAX_REPORTED_PROBLEMS);
+    if (reported == 0) {
+      // Not reachable while every description is bounded, but a lone oversized one is better
+      // reported in part than not at all; AutoshardingClient trims it to the limit.
+      return dropped.get(0);
+    }
+    return message + andMore(dropped.size() - reported);
   }
 
+  private static String andMore(int omitted) {
+    return omitted == 0 ? "" : String.format("; and %s more", omitted);
+  }
+
+  /**
+   * Hex-encodes a key for a human-readable description, shortening it if it is long. The
+   * protocol allows keys of up to 512 bytes, which would fill the entire error message budget
+   * twice over.
+   */
   private static String encode(@Nullable byte[] key) {
-    return key == null ? "inf" : BaseEncoding.base16().encode(key);
+    if (key == null) {
+      return "inf";
+    }
+    if (key.length <= MAX_ENCODED_KEY_BYTES) {
+      return BaseEncoding.base16().encode(key);
+    }
+    return BaseEncoding.base16().encode(key, 0, MAX_ENCODED_KEY_BYTES) + "...";
   }
 }

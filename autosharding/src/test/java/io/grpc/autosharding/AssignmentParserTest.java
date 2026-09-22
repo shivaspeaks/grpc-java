@@ -325,6 +325,54 @@ public class AssignmentParserTest {
   }
 
   /**
+   * An empty range is unroutable whatever it carries, and it need not sit next to another
+   * slice, so dropping it has to fall through to ordinary gap filling.
+   */
+  @Test
+  public void parse_zeroWidthSlice_withEndpointsAndNoNeighbour_leavesNoHole() {
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addEndpoints(endpoint("host-a"))
+            .addEndpoints(endpoint("host-b"))
+            .addSliceAssignments(sliceAssignment("", "a", 0))
+            .addSliceAssignments(sliceAssignment("m", "m", 1))
+            .addSliceAssignments(sliceAssignment("z", null, 0))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    assertThat(result.errorMessage).contains("is empty");
+    assertThat(result.assignment.getSlices()).hasSize(3);
+    assertSlice(result.assignment.getSlices().get(0), "", "a", 0);
+    // ["a", "z") is one gap, not two slices meeting at "m".
+    assertSlice(result.assignment.getSlices().get(1), "a", "z");
+    assertSlice(result.assignment.getSlices().get(2), "z", null, 0);
+  }
+
+  @Test
+  public void parse_singleKeySlice_isKept() {
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addEndpoints(endpoint("host-a"))
+            // How a server actually assigns exactly one key: end_key is the successor of
+            // start_key, not start_key itself.
+            .addSliceAssignments(
+                SliceAssignment.newBuilder()
+                    .setSlice(
+                        com.google.cloud.autosharding.v1.Slice.newBuilder()
+                            .setStartKey(ByteString.copyFromUtf8("m"))
+                            .setEndKey(ByteString.copyFrom(new byte[] {'m', 0})))
+                    .addEndpoints(PerSliceEndpointState.newBuilder().setEndpointIndex(0)))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    assertThat(result.errorMessage).isNull();
+    assertThat(result.assignment.getSlices()).hasSize(3);
+    assertThat(result.assignment.getSlices().get(1).getEndpoints()).containsExactly(0);
+  }
+
+  /**
    * The picker looks a key up by binary search over start keys, so two slices sharing one would
    * make the result depend on where the search happened to land.
    */
@@ -411,7 +459,24 @@ public class AssignmentParserTest {
   }
 
   @Test
-  public void parse_errorMessageIsCappedAtThreeProblems() {
+  public void parse_manyProblems_errorMessageStaysWithinTheAckBudget() {
+    AssignmentChunk.Builder chunk = AssignmentChunk.newBuilder();
+    for (int i = 0; i < 40; i++) {
+      // Inverted key range, so every one of them is dropped.
+      chunk.addSliceAssignments(sliceAssignment("z" + i, "a"));
+    }
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk.build()), 1);
+
+    assertThat(result.assignment).isNull();
+    // autosharding.proto: error_message "MUST NOT exceed 512 characters".
+    assertThat(result.errorMessage.length()).isAtMost(512);
+    assertThat(result.errorMessage).contains("greater than end_key");
+    assertThat(result.errorMessage).containsMatch("; and \\d+ more$");
+  }
+
+  @Test
+  public void parse_fewProblems_allAreReported() {
     AssignmentChunk.Builder chunk = AssignmentChunk.newBuilder();
     for (String startKey : new String[] {"v", "w", "x", "y", "z"}) {
       chunk.addSliceAssignments(sliceAssignment(startKey, "a"));
@@ -419,8 +484,30 @@ public class AssignmentParserTest {
 
     AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk.build()), 1);
 
-    assertThat(result.assignment).isNull();
-    assertThat(result.errorMessage).contains("and 2 more");
+    // Five short descriptions fit comfortably, so nothing is elided.
+    assertThat(result.errorMessage).doesNotContain("more");
+    assertThat(result.errorMessage.split("; ")).hasLength(5);
+  }
+
+  @Test
+  public void parse_longKeysAreShortenedInTheErrorMessage() {
+    byte[] longKey = new byte[512];
+    Arrays.fill(longKey, (byte) 0xAB);
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addSliceAssignments(
+                SliceAssignment.newBuilder()
+                    .setSlice(
+                        com.google.cloud.autosharding.v1.Slice.newBuilder()
+                            .setStartKey(ByteString.copyFrom(longKey))
+                            .setEndKey(ByteString.copyFromUtf8("a"))))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    // Hex-encoding 512 bytes in full would be 1024 characters on its own.
+    assertThat(result.errorMessage.length()).isAtMost(512);
+    assertThat(result.errorMessage).contains("...");
   }
 
   /** Parses chunks that are expected to be usable in their entirety. */

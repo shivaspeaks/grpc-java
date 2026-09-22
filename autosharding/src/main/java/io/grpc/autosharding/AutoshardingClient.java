@@ -62,6 +62,9 @@ import javax.annotation.concurrent.NotThreadSafe;
 final class AutoshardingClient {
   private static final Logger logger = Logger.getLogger(AutoshardingClient.class.getName());
 
+  /** The limit {@code autosharding.proto} places on {@code AssignmentAck.error_message}. */
+  private static final int MAX_ERROR_MESSAGE_CODE_POINTS = 512;
+
   /**
    * Receives validated assignments from the autosharding service.
    */
@@ -380,9 +383,24 @@ final class AutoshardingClient {
   }
 
   /**
-   * The {@code error_message} field must not exceed 512 characters.
+   * Enforces the limit {@code autosharding.proto} places on {@code AssignmentAck.error_message}:
+   * "The length of this field MUST NOT exceed 512 characters (Unicode code points, see
+   * https://google.aip.dev/210)".
+   *
+   * <p>A backstop only. {@link AssignmentParser} already assembles its summary to fit, so this
+   * should never actually cut anything.
    */
   private static String truncateErrorMessage(String message) {
-    return message.length() <= 512 ? message : message.substring(0, 512);
+    // A string never has more code points than chars, so this settles the common case without
+    // walking it.
+    if (message.length() <= MAX_ERROR_MESSAGE_CODE_POINTS) {
+      return message;
+    }
+    if (message.codePointCount(0, message.length()) <= MAX_ERROR_MESSAGE_CODE_POINTS) {
+      return message;
+    }
+    // Cutting on a code point boundary rather than a char boundary keeps a surrogate pair from
+    // being split into an unpaired surrogate, which does not survive UTF-8 encoding.
+    return message.substring(0, message.offsetByCodePoints(0, MAX_ERROR_MESSAGE_CODE_POINTS));
   }
 }
