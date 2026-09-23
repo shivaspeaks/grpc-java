@@ -1898,6 +1898,9 @@ public class ExternalProcessorClientInterceptorTest {
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
     final CountDownLatch appFinishedLatch = new CountDownLatch(1);
+    // Counted down once the ext_proc response has been fully delivered to the interceptor, so that
+    // the test thread's cancel() does not race with the ext_proc thread still driving the call.
+    final CountDownLatch extProcDoneLatch = new CountDownLatch(1);
 
     // External Processor Server
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl;
@@ -1937,6 +1940,7 @@ public class ExternalProcessorClientInterceptorTest {
                           .build())
                       .build());
                 }
+                extProcDoneLatch.countDown();
               }
             }).start();
           }
@@ -2015,6 +2019,7 @@ public class ExternalProcessorClientInterceptorTest {
 
     // Verify main call started with mutated headers
     assertThat(dataPlaneLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(extProcDoneLatch.await(5, TimeUnit.SECONDS)).isTrue();
     Metadata finalHeaders = capturedHeaders.get();
     assertThat(
             finalHeaders.get(Metadata.Key.of("x-mutated", Metadata.ASCII_STRING_MARSHALLER)))
@@ -2400,6 +2405,10 @@ public class ExternalProcessorClientInterceptorTest {
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
     final CountDownLatch bodySentLatch = new CountDownLatch(1);
+    // Counted down once the ext_proc response to the end-of-stream request has been fully delivered
+    // to the interceptor, so that the test thread's cancel() does not race with the ext_proc thread
+    // still driving the call.
+    final CountDownLatch extProcEosLatch = new CountDownLatch(1);
     final AtomicReference<ProcessingRequest> capturedRequest = new AtomicReference<>();
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl;
     extProcImpl = new ExternalProcessorGrpc.ExternalProcessorImplBase() {
@@ -2418,10 +2427,11 @@ public class ExternalProcessorClientInterceptorTest {
                       .setRequestHeaders(HeadersResponse.newBuilder().build())
                       .build());
                 } else if (request.hasRequestBody()) {
+                  boolean capturedBody = false;
                   if (capturedRequest.get() == null
                       && !request.getRequestBody().getBody().isEmpty()) {
                     capturedRequest.set(request);
-                    bodySentLatch.countDown();
+                    capturedBody = true;
                   }
                   BodyResponse.Builder bodyResponse = BodyResponse.newBuilder();
                   if (request.getRequestBody().getBody().isEmpty()
@@ -2447,6 +2457,12 @@ public class ExternalProcessorClientInterceptorTest {
                   responseObserver.onNext(ProcessingResponse.newBuilder()
                       .setRequestBody(bodyResponse.build())
                       .build());
+                  if (capturedBody) {
+                    bodySentLatch.countDown();
+                  }
+                  if (request.getRequestBody().getEndOfStream()) {
+                    extProcEosLatch.countDown();
+                  }
                 }
               }
             }).start();
@@ -2507,6 +2523,7 @@ public class ExternalProcessorClientInterceptorTest {
     proxyCall.halfClose();
 
     assertThat(bodySentLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(extProcEosLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(capturedRequest.get().getRequestBody().getBody().toStringUtf8())
         .contains("Hello World");
 
