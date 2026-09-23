@@ -24,6 +24,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Supplier;
 import com.google.common.collect.ImmutableList;
+import io.grpc.Attributes;
 import io.grpc.Channel;
 import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
@@ -190,14 +191,12 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       return failPermanently("autosharding: no channel factory supplied to the LB policy");
     }
 
+    // gRFC A119 gives the configuration and the endpoints separate handling rules, and an empty
+    // endpoint set only speaks to the latter. Everything below that is driven by comparing the
+    // new configuration against the old one therefore has to run first: storing the new
+    // configuration without acting on it would destroy the comparison, and the change would then
+    // be lost for good, since the following update would no longer look like a change at all.
     List<EquivalentAddressGroup> endpoints = resolvedAddresses.getAddresses();
-    if (endpoints.isEmpty()) {
-      // Tear the children down so that in-flight picks stop resolving to endpoints the resolver
-      // has retracted. The assignment is kept: it stays valid if the endpoints come back.
-      endpointMap.updateEndpoints(ImmutableList.of(), resolvedAddresses.getAttributes());
-      config = newConfig;
-      return failPermanently("autosharding: name resolver returned no endpoints");
-    }
 
     Channel previousChannel = shardingChannel;
     Status channelStatus = updateShardingServiceChannel(factory, newConfig);
@@ -210,13 +209,22 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     }
     config = newConfig;
 
+    // When the set is empty this tears the children down, so that in-flight picks stop resolving
+    // to endpoints the resolver has retracted.
     endpointMap.updateEndpoints(endpoints, resolvedAddresses.getAttributes());
 
-    // The target is resolved against the endpoints, so it can change even when the config did not.
+    // The locality arrives in the resolver attributes, so the target can change even when the
+    // config did not.
     maybeRecreateClient(
         shardingChannel != previousChannel,
-        resolveTarget(newConfig, endpoints),
+        resolveTarget(newConfig, resolvedAddresses.getAttributes()),
         newConfig.initialAssignmentTimeoutNanos);
+
+    if (endpoints.isEmpty()) {
+      // Any assignment is kept: it stays valid if the endpoints come back. Until they do,
+      // publishPicker() leaves this failure in place rather than publishing over it.
+      return failPermanently("autosharding: name resolver returned no endpoints");
+    }
 
     rebuildSliceMapAndPublish();
     return Status.OK;
@@ -227,9 +235,17 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     if (shutdown) {
       return;
     }
-    // Endpoints we already have remain usable; only report the failure if we have nothing.
-    if (endpointMap.size() > 0) {
-      logger.log(Level.FINE, "Ignoring name resolution error, endpoints still known: {0}", error);
+    // Endpoints from an earlier resolution stay usable, and the error is
+    // only reported when we are not already serving with them. Reporting it in that case is what
+    // makes a broken resolver visible; otherwise RPCs would fail with whatever the stale
+    // endpoints happen to be failing with, which names the wrong cause.
+    // The one addition is the initial assignment wait: RPCs queue until the timer
+    // fires, so a failed refresh must not turn that queue into failures.
+    boolean queueingForInitialAssignment = awaitingInitialAssignment && assignment == null;
+    if (endpointMap.size() > 0
+        && (queueingForInitialAssignment
+            || endpointMap.aggregateConnectivityState() == ConnectivityState.READY)) {
+      logger.log(Level.FINE, "Ignoring name resolution error, still serving: {0}", error);
       return;
     }
     helper.updateBalancingState(
@@ -305,10 +321,11 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
    * Replaces the {@link AutoshardingClient} when there is none yet, or when the channel to the
    * sharding service or the resolved target changed.
    *
-   * <p>gRFC A119 calls for a new client rather than an in-place update because the client's
-   * accepted-generation watermark is only meaningful against the server and the resource it was
-   * learned from; carrying it over could make a different server withhold assignments
-   * indefinitely.
+   * <p>What gRFC A119 requires is a new channel and a new stream on it; whether the existing
+   * client is handed the new channel or a new client is built around it is left open. We replace
+   * the client because its accepted-generation watermark is only meaningful against the server
+   * and the resource it was learned from; carrying it over could make a different server withhold
+   * assignments indefinitely.
    *
    * <p>Creating a client also restarts the initial assignment timer, since the new one has to
    * start from scratch. Any assignment carried over from the previous client keeps being served
@@ -338,20 +355,22 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
   }
 
   /**
-   * Substitutes the optional {@code %s} token in the configured target with the locality of the
-   * resolved endpoints, or with the empty string when no locality is available.
+   * Substitutes the optional {@code %s} token in the configured target with the locality this
+   * policy instance is balancing within, or with the empty string when no locality is available.
    *
-   * <p>{@link EquivalentAddressGroup#ATTR_LOCALITY_NAME} is preferred over an xDS-specific
-   * attribute so that a plain name resolver can supply it too, which is what gRFC A119 asks of
-   * non-xDS users. All endpoints reaching one instance of this policy share a locality.
+   * <p>The locality is a property of the policy instance, so it is read from the resolver
+   * attributes rather than from any endpoint. Reading it from an endpoint would be wrong in the
+   * mode where this policy does its own locality picking: it is then handed endpoints from every
+   * locality, and picking one of them would make the target depend on resolver ordering. gRFC
+   * A119 says the token is not meant to be used in that mode, and leaving
+   * {@link AutoShardingAttributes#ATTR_LOCALITY} unset there resolves it to the empty string.
    */
   private static String resolveTarget(
-      AutoShardingLoadBalancerConfig config, List<EquivalentAddressGroup> endpoints) {
+      AutoShardingLoadBalancerConfig config, Attributes resolverAttributes) {
     if (!config.autoshardingTarget.contains("%s")) {
       return config.autoshardingTarget;
     }
-    String locality =
-        endpoints.get(0).getAttributes().get(EquivalentAddressGroup.ATTR_LOCALITY_NAME);
+    String locality = resolverAttributes.get(AutoShardingAttributes.ATTR_LOCALITY);
     return config.autoshardingTarget.replace("%s", locality == null ? "" : locality);
   }
 

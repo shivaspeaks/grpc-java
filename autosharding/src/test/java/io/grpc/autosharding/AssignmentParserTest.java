@@ -396,7 +396,9 @@ public class AssignmentParserTest {
   }
 
   @Test
-  public void parse_overlappingSlices_theLaterOneIsDropped() {
+  public void parse_overlappingSlices_bothAreDropped() {
+    // There is no way to tell which of the two the server meant, so neither is used and the keys
+    // they covered become a gap.
     AssignmentChunk chunk =
         AssignmentChunk.newBuilder()
             .addSliceAssignments(sliceAssignment("a", "m"))
@@ -406,15 +408,47 @@ public class AssignmentParserTest {
     AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
 
     assertThat(result.errorMessage).contains("overlaps");
-    // ["", "a") and ["m", inf) are gaps around the slice that survived.
-    assertThat(result.assignment.getSlices()).hasSize(3);
-    assertSlice(result.assignment.getSlices().get(0), "", "a");
-    assertSlice(result.assignment.getSlices().get(1), "a", "m");
-    assertSlice(result.assignment.getSlices().get(2), "m", null);
+    assertThat(result.assignment).isNull();
   }
 
   @Test
-  public void parse_duplicateStartKeys_theSecondOneIsDropped() {
+  public void parse_overlappingSlices_aSliceClearOfThemSurvives() {
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addSliceAssignments(sliceAssignment("a", "m"))
+            .addSliceAssignments(sliceAssignment("d", "p"))
+            .addSliceAssignments(sliceAssignment("p", "z"))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    assertThat(result.errorMessage).contains("overlaps");
+    // ["p", "z") abuts the overlap without entering it, so only it is kept.
+    assertThat(result.assignment.getSlices()).hasSize(3);
+    assertSlice(result.assignment.getSlices().get(0), "", "p");
+    assertSlice(result.assignment.getSlices().get(1), "p", "z");
+    assertSlice(result.assignment.getSlices().get(2), "z", null);
+    assertThat(result.assignment.getSlices().get(0).getEndpoints()).isEmpty();
+  }
+
+  @Test
+  public void parse_slicesOverlappingOnlyThroughAThird_areAllDropped() {
+    // ["b", "c") and ["d", "e") are disjoint, but both collide with ["a", "z"), so all three go.
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addSliceAssignments(sliceAssignment("a", "z"))
+            .addSliceAssignments(sliceAssignment("b", "c"))
+            .addSliceAssignments(sliceAssignment("d", "e"))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    assertThat(result.errorMessage).contains("overlaps");
+    assertThat(result.assignment).isNull();
+  }
+
+  @Test
+  public void parse_duplicateStartKeys_bothAreDropped() {
     AssignmentChunk chunk =
         AssignmentChunk.newBuilder()
             .addSliceAssignments(sliceAssignment("a", "m"))
@@ -424,12 +458,11 @@ public class AssignmentParserTest {
     AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
 
     assertThat(result.errorMessage).contains("overlaps");
-    assertThat(result.assignment.getSlices()).hasSize(3);
-    assertSlice(result.assignment.getSlices().get(1), "a", "m");
+    assertThat(result.assignment).isNull();
   }
 
   @Test
-  public void parse_sliceExtendingToInfinityFollowedByAnother_theLaterOneIsDropped() {
+  public void parse_sliceExtendingToInfinityFollowedByAnother_bothAreDropped() {
     AssignmentChunk chunk =
         AssignmentChunk.newBuilder()
             .addSliceAssignments(sliceAssignment("a", null))
@@ -439,9 +472,7 @@ public class AssignmentParserTest {
     AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
 
     assertThat(result.errorMessage).contains("overlaps");
-    assertThat(result.assignment.getSlices()).hasSize(2);
-    assertSlice(result.assignment.getSlices().get(0), "", "a");
-    assertSlice(result.assignment.getSlices().get(1), "a", null);
+    assertThat(result.assignment).isNull();
   }
 
   @Test

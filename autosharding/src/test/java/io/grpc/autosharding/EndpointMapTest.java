@@ -194,10 +194,33 @@ public class EndpointMapTest {
   @Test
   public void updateEndpoints_doesNotNotifyListenerWhileRebuilding() {
     // New children publish their initial IDLE state from inside updateEndpoints(). Forwarding
-    // those would make the LB policy build a picker from a half-rebuilt map.
+    // those would make the LB policy publish one picker per endpoint for a single update.
     endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
 
     assertThat(stateUpdates).isEmpty();
+  }
+
+  @Test
+  public void updateEndpoints_childReenteringDuringUpdate_seesTheCompleteNewEndpointSet() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+    activate(0);
+    activate(1);
+
+    // Surviving children are handed their new addresses from inside updateEndpoints() and can
+    // call straight back in. Record how the map looks from in there.
+    List<Integer> observedSizes = new ArrayList<>();
+    List<Integer> observedIndicesOfC = new ArrayList<>();
+    childProvider.onAccept =
+        () -> {
+          observedSizes.add(endpointMap.size());
+          observedIndicesOfC.add(endpointMap.indexOf("c"));
+        };
+
+    endpointMap.updateEndpoints(endpoints("a", "b", "c"), Attributes.EMPTY);
+
+    // Both callbacks see all three endpoints and the final indices, never a partial rebuild.
+    assertThat(observedSizes).containsExactly(3, 3);
+    assertThat(observedIndicesOfC).containsExactly(2, 2);
   }
 
   @Test
@@ -495,6 +518,9 @@ public class EndpointMapTest {
   private static final class FakeChildProvider extends LoadBalancerProvider {
     final List<FakeChild> children = new ArrayList<>();
 
+    /** Run from every child's {@code acceptResolvedAddresses}, to exercise re-entrancy. */
+    Runnable onAccept;
+
     @Override
     public boolean isAvailable() {
       return true;
@@ -512,7 +538,7 @@ public class EndpointMapTest {
 
     @Override
     public LoadBalancer newLoadBalancer(Helper helper) {
-      FakeChild child = new FakeChild(helper);
+      FakeChild child = new FakeChild(helper, this);
       children.add(child);
       return child;
     }
@@ -521,19 +547,24 @@ public class EndpointMapTest {
   /** Stands in for {@code pick_first}, including its move to CONNECTING when asked to connect. */
   private static final class FakeChild extends LoadBalancer {
     private final Helper helper;
+    private final FakeChildProvider provider;
     ResolvedAddresses lastAddresses;
     int acceptCount;
     int requestConnectionCount;
     boolean shutdown;
 
-    FakeChild(Helper helper) {
+    FakeChild(Helper helper, FakeChildProvider provider) {
       this.helper = helper;
+      this.provider = provider;
     }
 
     @Override
     public Status acceptResolvedAddresses(ResolvedAddresses resolvedAddresses) {
       lastAddresses = resolvedAddresses;
       acceptCount++;
+      if (provider.onAccept != null) {
+        provider.onAccept.run();
+      }
       return Status.OK;
     }
 

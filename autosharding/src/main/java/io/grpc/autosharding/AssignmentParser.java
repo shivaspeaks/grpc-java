@@ -42,7 +42,8 @@ import javax.annotation.Nullable;
  *       {@code endKey} and so runs to the end of the keyspace;
  *   <li>every endpoint index it references is valid once the endpoint names from all chunks are
  *       combined in chunk order;
- *   <li>its key range does not overlap a slice that was already kept.
+ *   <li>its key range overlaps no other slice; when slices do overlap, all of them are dropped,
+ *       since there is no basis for preferring one over another.
  * </ul>
  *
  * <p>A slice that fails any of these is <em>dropped and treated as a gap</em> rather than
@@ -171,18 +172,9 @@ final class AssignmentParser {
             continue;
           }
           if (keyOrder == 0) {
-            // Satisfies the gRFC's "start_key <= end_key", but end_key is exclusive, so
-            // [k, k) is the empty range rather than the single key k. A server wanting to
-            // assign one key sends [k, k+1), i.e. an end_key of k with a trailing 0x00.
-            //
-            // Keeping it would put a second entry with the same start key in the SliceMap,
-            // and the picker resolves a key by binary search over start keys, so a key equal
-            // to this one could resolve to either entry. Any endpoints on it are no loss:
-            // no key can fall in an empty range, so they were unreachable through it anyway,
-            // and the assignment's endpoint list is built from the chunks, not from slices.
-            //
-            // Nor can dropping it open a gap -- it covered nothing -- so the gap-filling pass
-            // below produces the same coverage with or without it.
+            // end_key is exclusive, so [k, k) is the empty range rather than the single key k.
+            // A server wanting to assign one key sends [k, k+1), i.e. an end_key of k with a
+            // trailing 0x00. Dropping this cannot open a gap, because it covered nothing.
             dropped.add(
                 String.format("slice [%s, %s) is empty", encode(startKey), encode(endKey)));
             continue;
@@ -214,8 +206,15 @@ final class AssignmentParser {
   }
 
   /**
-   * Returns the slices of {@code sorted} that do not overlap one another, preferring the slice
-   * with the lower {@code startKey} whenever two of them collide.
+   * Returns the slices of {@code sorted} that overlap no other slice.
+   *
+   * <p>When slices overlap, every one of them is dropped. The server has told us two different
+   * things about the same key and there is no basis for preferring either, so the keys they cover
+   * become a gap.
+   *
+   * <p>Overlap is transitive here in the sense that matters: a slice is dropped when it overlaps
+   * any other slice, even one it only reaches through a third. {@code ["a", "z")}, {@code ["b",
+   * "c")} and {@code ["d", "e")} all go, because the first overlaps the other two.
    *
    * @param sorted slices in ascending {@code startKey} order
    * @param dropped collects a description of each slice that was dropped
@@ -223,31 +222,42 @@ final class AssignmentParser {
   private static List<Assignment.Slice> dropOverlaps(
       List<Assignment.Slice> sorted, List<String> dropped) {
     List<Assignment.Slice> kept = new ArrayList<>(sorted.size());
-    Assignment.Slice previous = null;
-    for (Assignment.Slice slice : sorted) {
-      if (previous != null && overlaps(previous, slice)) {
-        dropped.add(
-            String.format(
-                "slice starting at %s overlaps the slice [%s, %s)",
-                encode(slice.getStartKey()),
-                encode(previous.getStartKey()),
-                encode(previous.getEndKey())));
-        continue;
+    int index = 0;
+    while (index < sorted.size()) {
+      // Extend a run of slices for as long as the keys covered so far reach into the next one.
+      // Every slice that joins overlaps some earlier member, and the first two overlap directly,
+      // so a run longer than one slice consists entirely of slices that overlap something.
+      byte[] runEndKey = sorted.get(index).getEndKey();
+      int end = index + 1;
+      while (end < sorted.size() && reaches(runEndKey, sorted.get(end).getStartKey())) {
+        byte[] endKey = sorted.get(end).getEndKey();
+        if (endKey == null || UNSIGNED_BYTES_COMPARATOR.compare(endKey, runEndKey) > 0) {
+          runEndKey = endKey;
+        }
+        end++;
       }
-      kept.add(slice);
-      previous = slice;
+
+      if (end - index == 1) {
+        kept.add(sorted.get(index));
+      } else {
+        for (Assignment.Slice slice : sorted.subList(index, end)) {
+          dropped.add(
+              String.format(
+                  "slice [%s, %s) overlaps another slice",
+                  encode(slice.getStartKey()), encode(slice.getEndKey())));
+        }
+      }
+      index = end;
     }
     return kept;
   }
 
   /**
-   * Returns whether {@code later}, which starts at or after {@code earlier}, shares any key with
-   * it. A slice with no end key runs to the end of the keyspace and so overlaps everything that
-   * follows it.
+   * Returns whether a range ending at {@code endKey} covers {@code startKey}, which is known not
+   * to precede it. A null {@code endKey} runs to the end of the keyspace and so covers everything.
    */
-  private static boolean overlaps(Assignment.Slice earlier, Assignment.Slice later) {
-    return earlier.getEndKey() == null
-        || UNSIGNED_BYTES_COMPARATOR.compare(earlier.getEndKey(), later.getStartKey()) > 0;
+  private static boolean reaches(@Nullable byte[] endKey, byte[] startKey) {
+    return endKey == null || UNSIGNED_BYTES_COMPARATOR.compare(endKey, startKey) > 0;
   }
 
   /**
@@ -260,7 +270,8 @@ final class AssignmentParser {
     byte[] cursor = EMPTY_BYTES;
     for (Assignment.Slice slice : sorted) {
       if (cursor == null) {
-        // Unreachable: dropOverlaps() discards any slice following an infinity-ended slice.
+        // Unreachable: an infinity-ended slice overlaps anything after it, so dropOverlaps()
+        // drops the whole run; a kept one is always last.
         break;
       }
       if (UNSIGNED_BYTES_COMPARATOR.compare(cursor, slice.getStartKey()) < 0) {

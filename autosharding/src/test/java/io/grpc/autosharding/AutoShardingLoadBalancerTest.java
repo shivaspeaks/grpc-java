@@ -21,6 +21,7 @@ import static io.grpc.ConnectivityState.CONNECTING;
 import static io.grpc.ConnectivityState.IDLE;
 import static io.grpc.ConnectivityState.READY;
 import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -91,6 +92,7 @@ public class AutoShardingLoadBalancerTest {
   private static final String UNKNOWN_CHANNEL_FACTORY_KEY = "unknown-key";
   private static final String TARGET = "autosharding-target";
   private static final String KEY_HEADER = "x-shard-key";
+  private static final String OTHER_KEY_HEADER = "x-other-shard-key";
   private static final long ASSIGNMENT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
   private static final long POLL_TIMEOUT_SECONDS = 5;
   private static final MethodDescriptor<Void, Void> METHOD = TestMethodDescriptors.voidMethod();
@@ -174,6 +176,17 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
+  public void emptyKeyHeaderName_isRejected() {
+    // Not a supported mode: with no key header every RPC would carry the empty key and the whole
+    // channel would end up on whichever slice covers it. C++ rejects this at config-parse time.
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new AutoShardingLoadBalancerConfig(
+                CHANNEL_FACTORY_KEY, TARGET, "", true, ASSIGNMENT_TIMEOUT_NANOS));
+  }
+
+  @Test
   public void missingChannelFactory_reportsTransientFailure() {
     Status status =
         acceptAddresses(
@@ -218,6 +231,42 @@ public class AutoShardingLoadBalancerTest {
 
     assertThat(currentState).isEqualTo(READY);
     assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  @Test
+  public void channelFactoryKeyChangedWhileEndpointsEmpty_stillCreatesTheNewChannel() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
+
+    // An empty endpoint set says nothing about the configuration, so the new key still takes
+    // effect. Recording the config without acting on it would make the next update look
+    // unchanged, stranding the policy on the old sharding service for good.
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, true));
+
+    assertThat(channelFactory.keys)
+        .containsExactly(CHANNEL_FACTORY_KEY, OTHER_CHANNEL_FACTORY_KEY)
+        .inOrder();
+    assertThat(channelFactory.isReleased(0)).isTrue();
+
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, true), "a");
+
+    // Already applied above; the restored endpoints must not cause a second channel.
+    assertThat(channelFactory.keys).hasSize(2);
+  }
+
+  @Test
+  public void keyHeaderNameChangedWhileEndpointsEmpty_stillTakesEffect() throws Exception {
+    deliverAddresses(configWithKeyHeader(KEY_HEADER), "a", "b");
+    deliverAssignment(1, slice("", "a"), slice("m", "b"));
+
+    deliverAddresses(configWithKeyHeader(OTHER_KEY_HEADER));
+    deliverAddresses(configWithKeyHeader(OTHER_KEY_HEADER), "a", "b");
+    reportReady("a");
+    reportReady("b");
+
+    // Read under the new header, "z" is past "m" and belongs to "b". Were the policy still
+    // reading the old header, it would find nothing, and the empty key would send this to "a".
+    assertThat(pickedHost(pick(OTHER_KEY_HEADER, "z"))).isEqualTo("b");
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -276,8 +325,8 @@ public class AutoShardingLoadBalancerTest {
   public void targetWithLocalityToken_isSubstituted() throws Exception {
     acceptAddresses(
         ResolvedAddresses.newBuilder()
-            .setAddresses(ImmutableList.of(endpointInLocality("a", "us-central1-a")))
-            .setAttributes(attributesWithChannelFactory())
+            .setAddresses(endpoints("a"))
+            .setAttributes(attributesWithLocality("us-central1-a"))
             .setLoadBalancingPolicyConfig(retargetedConfig("target/%s"))
             .build());
 
@@ -290,16 +339,16 @@ public class AutoShardingLoadBalancerTest {
     AutoShardingLoadBalancerConfig localityConfig = retargetedConfig("target/%s");
     acceptAddresses(
         ResolvedAddresses.newBuilder()
-            .setAddresses(ImmutableList.of(endpointInLocality("a", "us-central1-a")))
-            .setAttributes(attributesWithChannelFactory())
+            .setAddresses(endpoints("a"))
+            .setAttributes(attributesWithLocality("us-central1-a"))
             .setLoadBalancingPolicyConfig(localityConfig)
             .build());
     takeRequest();
 
     acceptAddresses(
         ResolvedAddresses.newBuilder()
-            .setAddresses(ImmutableList.of(endpointInLocality("a", "us-central1-b")))
-            .setAttributes(attributesWithChannelFactory())
+            .setAddresses(endpoints("a"))
+            .setAttributes(attributesWithLocality("us-central1-b"))
             .setLoadBalancingPolicyConfig(localityConfig)
             .build());
 
@@ -314,6 +363,55 @@ public class AutoShardingLoadBalancerTest {
     deliverAddresses(retargetedConfig("target/%s"), "a");
 
     assertThat(takeRequest().getInitialClientConfig().getTarget()).isEqualTo("target/");
+  }
+
+  @Test
+  public void targetWithLocalityToken_endpointsSpanLocalities_substitutesEmptyString()
+      throws Exception {
+    // The policy is doing its own locality picking, so it sees endpoints from every locality and
+    // no locality attribute. gRFC A119 says the token is not meant to be used here; the target
+    // must not end up depending on which endpoint the resolver happened to list first.
+    acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(
+                ImmutableList.of(
+                    endpointInLocality("a", "us-central1-a"),
+                    endpointInLocality("b", "us-central1-b")))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(retargetedConfig("target/%s"))
+            .build());
+
+    assertThat(takeRequest().getInitialClientConfig().getTarget()).isEqualTo("target/");
+  }
+
+  @Test
+  public void targetWithLocalityToken_endpointReordering_doesNotRecreateTheClient()
+      throws Exception {
+    AutoShardingLoadBalancerConfig localityConfig = retargetedConfig("target/%s");
+    acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(
+                ImmutableList.of(
+                    endpointInLocality("a", "us-central1-a"),
+                    endpointInLocality("b", "us-central1-b")))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(localityConfig)
+            .build());
+    takeRequest();
+
+    // Same endpoints, other order. Sourcing the locality from the first endpoint would change the
+    // target here and reconnect the client to a different sharding resource.
+    acceptAddresses(
+        ResolvedAddresses.newBuilder()
+            .setAddresses(
+                ImmutableList.of(
+                    endpointInLocality("b", "us-central1-b"),
+                    endpointInLocality("a", "us-central1-a")))
+            .setAttributes(attributesWithChannelFactory())
+            .setLoadBalancingPolicyConfig(localityConfig)
+            .build());
+
+    assertThat(service.streamCount.get()).isEqualTo(1);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -618,6 +716,39 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
+  public void nameResolutionError_withEndpointsButNoneReady_reportsTheResolverError()
+      throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "a"));
+    reportTransientFailure("a");
+
+    syncContext.execute(
+        () -> loadBalancer.handleNameResolutionError(Status.UNAVAILABLE.withDescription("boom")));
+
+    // We are not serving, so the resolver failure is the more useful thing to report. Leaving it
+    // out would make RPCs blame the endpoints we can no longer refresh.
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("k").getStatus().getDescription()).contains("boom");
+  }
+
+  @Test
+  public void nameResolutionError_whileAwaitingInitialAssignment_keepsQueueing() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    // Not READY, so only the initial assignment wait can be holding these RPCs.
+    reportTransientFailure("a");
+    assertThat(currentState).isEqualTo(CONNECTING);
+
+    syncContext.execute(
+        () -> loadBalancer.handleNameResolutionError(Status.UNAVAILABLE.withDescription("boom")));
+
+    // gRFC A119 holds RPCs until the initial assignment timer fires; a failed refresh of
+    // endpoints we already have must not cut that short.
+    assertThat(currentState).isEqualTo(CONNECTING);
+    assertThat(pick("k").getStatus().isOk()).isTrue();
+    assertThat(pick("k").getSubchannel()).isNull();
+  }
+
+  @Test
   public void shutdown_closesChannelAndChildren() {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
     activate("a");
@@ -663,9 +794,22 @@ public class AutoShardingLoadBalancerTest {
         CHANNEL_FACTORY_KEY, target, KEY_HEADER, true, ASSIGNMENT_TIMEOUT_NANOS);
   }
 
+  /** The default config with a different {@code key_header_name}. */
+  private AutoShardingLoadBalancerConfig configWithKeyHeader(String keyHeaderName) {
+    return new AutoShardingLoadBalancerConfig(
+        CHANNEL_FACTORY_KEY, TARGET, keyHeaderName, true, ASSIGNMENT_TIMEOUT_NANOS);
+  }
+
   private Attributes attributesWithChannelFactory() {
     return Attributes.newBuilder()
         .set(AutoShardingAttributes.ATTR_CHANNEL_FACTORY, channelFactory)
+        .build();
+  }
+
+  /** Resolver attributes as they look under a locality picker, which supplies the locality. */
+  private Attributes attributesWithLocality(String locality) {
+    return attributesWithChannelFactory().toBuilder()
+        .set(AutoShardingAttributes.ATTR_LOCALITY, locality)
         .build();
   }
 
@@ -787,8 +931,12 @@ public class AutoShardingLoadBalancerTest {
   }
 
   private PickResult pick(String key) {
+    return pick(KEY_HEADER, key);
+  }
+
+  private PickResult pick(String headerName, String key) {
     Metadata headers = new Metadata();
-    headers.put(Metadata.Key.of(KEY_HEADER, Metadata.ASCII_STRING_MARSHALLER), key);
+    headers.put(Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER), key);
     return currentPicker.pickSubchannel(
         new PickSubchannelArgsImpl(METHOD, headers, CallOptions.DEFAULT, new PickDetailsConsumer() {
         }));

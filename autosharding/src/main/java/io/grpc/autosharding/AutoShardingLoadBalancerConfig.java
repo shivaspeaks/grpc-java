@@ -16,6 +16,7 @@
 
 package io.grpc.autosharding;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.base.MoreObjects;
@@ -26,8 +27,10 @@ import java.util.concurrent.TimeUnit;
  * Configuration for the {@code autosharding_experimental} LB policy, as specified by
  * {@code AutoshardingLbConfig} in gRFC A119.
  *
- * <p>Parsing this out of service config JSON belongs to the LB policy provider, which is added
- * along with the policy's public API.
+ * <p>{@link AutoShardingLoadBalancerProvider} parses this out of service config JSON and reports
+ * a bad configuration as a {@link io.grpc.NameResolver.ConfigOrError}, so the channel gets a
+ * useful message instead of an exception. The constructor here re-checks the same constraints as
+ * a backstop that cannot be bypassed.
  */
 final class AutoShardingLoadBalancerConfig {
 
@@ -46,16 +49,15 @@ final class AutoShardingLoadBalancerConfig {
    */
   final String autoshardingTarget;
 
-  /**
-   * Name of the request header holding the application-defined sharding key. Empty means every
-   * RPC is treated as having an empty key.
-   */
+  /** Name of the request header holding the application-defined sharding key. Never empty. */
   final String keyHeaderName;
 
   /** Whether RPCs may fall back to the full set of resolved endpoints. */
   final boolean enableFallback;
 
-  /** How long to wait for the first assignment after creating a channel to the service. */
+  /**
+   * How long to wait for the first assignment after creating a channel to the service.
+   */
   final long initialAssignmentTimeoutNanos;
 
   AutoShardingLoadBalancerConfig(
@@ -67,6 +69,11 @@ final class AutoShardingLoadBalancerConfig {
     this.channelFactoryKey = checkNotNull(channelFactoryKey, "channelFactoryKey");
     this.autoshardingTarget = checkNotNull(autoshardingTarget, "autoshardingTarget");
     this.keyHeaderName = checkNotNull(keyHeaderName, "keyHeaderName");
+    checkArgument(!keyHeaderName.isEmpty(), "keyHeaderName is empty");
+    checkArgument(
+        initialAssignmentTimeoutNanos >= 0,
+        "initialAssignmentTimeoutNanos is negative: %s",
+        initialAssignmentTimeoutNanos);
     this.enableFallback = enableFallback;
     this.initialAssignmentTimeoutNanos = initialAssignmentTimeoutNanos;
   }

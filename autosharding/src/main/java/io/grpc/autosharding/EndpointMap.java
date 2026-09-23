@@ -69,11 +69,17 @@ import javax.annotation.concurrent.NotThreadSafe;
  *
  * <h3>Lifecycle</h3>
  *
- * <p>gRFC A119 describes building a brand new map on every resolver update. This class instead
- * keeps one long-lived instance and rebuilds its contents in {@link #updateEndpoints}, which is
- * the only method that changes the set of endpoints or their indices. Retaining the instance
- * lets child load balancers — and therefore established connections — survive a resolver update
- * that merely adds or removes unrelated endpoints.
+ * <p>gRFC A119 says the policy "must create a new {@code EndpointMap} whenever it receives
+ * endpoints from the Name Resolver". This class instead keeps one long-lived instance and
+ * rebuilds its contents in {@link #updateEndpoints}, which is the only method that changes the
+ * set of endpoints or their indices.
+ *
+ * <p>The difference is mechanical, not observable. Taken literally the gRFC's pseudocode builds
+ * fresh endpoint states with no child load balancer carried over, which would drop every
+ * connection on every resolver update; the C++ implementation accordingly builds a new map but
+ * moves surviving endpoints into it. Retaining the instance achieves the same thing and lets
+ * child load balancers — and therefore established connections — survive a resolver update that
+ * merely adds or removes unrelated endpoints.
  *
  * <h3>Threading model</h3>
  *
@@ -101,10 +107,15 @@ final class EndpointMap {
   private final Map<String, Integer> indexByHostname = new HashMap<>();
 
   /**
-   * Set while {@link #updateEndpoints} is running. Children report a state synchronously from
-   * within that method, and forwarding those reports would make the LB policy publish a picker
-   * built from a half-rebuilt map. gRFC A119 avoids this by building a whole new map and
-   * swapping it in; rebuilding in place is what makes the flag necessary.
+   * Set while children are being handed their new addresses in {@link #updateEndpoints}. A child
+   * usually reports a state synchronously from that call, and forwarding every one would have
+   * the LB policy publish a picker per endpoint for a single resolver update. The state and
+   * picker are still recorded; only the notification is skipped, and the caller publishes once
+   * afterwards.
+   *
+   * <p>Not specific to this policy: {@code MultiChildLoadBalancer} in {@code io.grpc.util}, which
+   * backs {@code round_robin}, {@code ring_hash}, {@code weighted_target} and the rest, carries
+   * the same flag as {@code resolvingAddresses} for the same reason.
    */
   private boolean rebuilding;
 
@@ -135,7 +146,13 @@ final class EndpointMap {
    * endpoints start out IDLE with no child load balancer instantiated.
    *
    * <p>If several endpoints resolve to the same hostname, the first one wins and the rest are
-   * dropped, as permitted by gRFC A119.
+   * dropped.
+   *
+   * <p>Children handed new addresses here often report a connectivity state before this method
+   * returns. Those reports are recorded but not forwarded to the {@code childStateListener}, so
+   * that one resolver update produces one picker rather than one per endpoint. <strong>The
+   * caller must therefore publish a picker itself once this returns</strong>, or the channel is
+   * left holding a picker built from the previous endpoint set.
    *
    * @param endpoints the endpoints from the resolver, in the order the resolver supplied them
    * @param attributes the resolver attributes, forwarded to every child load balancer
@@ -159,19 +176,21 @@ final class EndpointMap {
       }
     }
 
+    // Install the whole endpoint set and its indices before touching any child. A child given
+    // addresses in the second pass can call back in synchronously, and everything it can reach
+    // -- size(), indexOf(), toPickerEndpoints() -- has to already agree on the new set.
+    holders.clear();
+    indexByHostname.clear();
+    for (String hostname : addressesByHostname.keySet()) {
+      EndpointHolder survivor = survivors.get(hostname);
+      indexByHostname.put(hostname, holders.size());
+      holders.add(survivor != null ? survivor : new EndpointHolder(hostname));
+    }
+
     rebuilding = true;
     try {
-      holders.clear();
-      indexByHostname.clear();
-      for (Map.Entry<String, EquivalentAddressGroup> entry : addressesByHostname.entrySet()) {
-        String hostname = entry.getKey();
-        EndpointHolder holder = survivors.get(hostname);
-        if (holder == null) {
-          holder = new EndpointHolder(hostname);
-        }
-        indexByHostname.put(hostname, holders.size());
-        holders.add(holder);
-        holder.updateAddresses(entry.getValue(), attributes);
+      for (EndpointHolder holder : holders) {
+        holder.updateAddresses(addressesByHostname.get(holder.hostname), attributes);
       }
     } finally {
       rebuilding = false;

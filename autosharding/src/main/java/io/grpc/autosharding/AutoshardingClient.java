@@ -220,7 +220,20 @@ final class AutoshardingClient {
      */
     private final List<AssignmentChunk> bufferedChunks = new ArrayList<>();
 
-    @Nullable private ClientCallStreamObserver<WatchShardingAssignmentRequest> requestStream;
+    /**
+     * The sending half of the stream. {@link ClientCalls} invokes {@link #beforeStart} before it
+     * starts the call and before it returns, so this is set before {@link #start} can send and
+     * before this stream is reachable by anything else.
+     */
+    private ClientCallStreamObserver<WatchShardingAssignmentRequest> requestStream;
+
+    /**
+     * Whether this stream delivered an assignment the load balancer could use, which is the only
+     * thing gRFC A119 resets the retry backoff on. An assignment dropped as stale, or rejected
+     * for having no usable slice, leaves the balancer with nothing newer than it already had, so
+     * the following attempt still backs off. A server that honours {@code latest_generation} does
+     * not resend an already-accepted assignment after a reconnect anyway.
+     */
     private boolean receivedGoodAssignment;
     private boolean closed;
 
@@ -238,6 +251,7 @@ final class AutoshardingClient {
               AutoshardingServiceGrpc.getWatchShardingAssignmentMethod(),
               CallOptions.DEFAULT.withWaitForReady()),
           this);
+      // The call is started inside the above, so the config cannot go out from beforeStart().
       sendInitialClientConfig();
     }
 
@@ -370,9 +384,7 @@ final class AutoshardingClient {
       }
       closed = true;
       bufferedChunks.clear();
-      if (requestStream != null) {
-        requestStream.cancel(status.getDescription(), status.getCause());
-      }
+      requestStream.cancel(status.getDescription(), status.getCause());
     }
   }
 

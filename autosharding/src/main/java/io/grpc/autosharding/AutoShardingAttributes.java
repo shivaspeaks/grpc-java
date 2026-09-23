@@ -51,5 +51,22 @@ public final class AutoShardingAttributes {
   public static final Attributes.Key<ChannelFactory> ATTR_CHANNEL_FACTORY =
       Attributes.Key.create("io.grpc.autosharding.channelFactory");
 
+  /**
+   * Locality this instance of the LB policy is balancing within, substituted for the {@code %s}
+   * token in {@code autosharding_target}.
+   *
+   * <p>A resolver-state attribute, not a per-endpoint one, because it describes the policy
+   * instance rather than any single endpoint. gRFC A119 only defines it for the mode where this
+   * policy sits under a locality picker and therefore sees one locality; when the policy handles
+   * locality picking itself it sees endpoints from every locality, and the absence of this
+   * attribute is what makes the {@code %s} token correctly resolve to the empty string.
+   *
+   * <p>In xDS deployments the xDS integration populates this from the locality name that
+   * {@code weighted_target_experimental} publishes. Otherwise the application's name resolver is
+   * responsible for setting it, and need only do so if its target contains a {@code %s} token.
+   */
+  public static final Attributes.Key<String> ATTR_LOCALITY =
+      Attributes.Key.create("io.grpc.autosharding.locality");
+
   private AutoShardingAttributes() {}
 }
