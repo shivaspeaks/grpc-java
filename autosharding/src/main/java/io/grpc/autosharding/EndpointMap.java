@@ -27,6 +27,7 @@ import com.google.common.collect.ImmutableList;
 import io.grpc.Attributes;
 import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
+import io.grpc.InternalEquivalentAddressGroup;
 import io.grpc.LoadBalancer.FixedResultPicker;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.PickResult;
@@ -318,7 +319,8 @@ final class EndpointMap {
    * address when the hostname attribute from gRFC A81 is absent, per gRFC A119.
    */
   private static String hostnameOf(EquivalentAddressGroup endpoint) {
-    String hostname = endpoint.getAttributes().get(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME);
+    String hostname =
+        endpoint.getAttributes().get(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME);
     return hostname != null ? hostname : endpoint.getAddresses().get(0).toString();
   }
 

@@ -28,6 +28,7 @@ import com.google.common.collect.ImmutableList;
 import io.grpc.Attributes;
 import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
+import io.grpc.InternalEquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.PickResult;
@@ -470,7 +471,7 @@ public class EndpointMapTest {
               .getAddresses()
               .get(0)
               .getAttributes()
-              .get(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME);
+              .get(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME);
       if (hostname.equals(childHostname)) {
         return child;
       }
@@ -496,7 +497,7 @@ public class EndpointMapTest {
     return new EquivalentAddressGroup(
         new NamedAddress(addressName),
         Attributes.newBuilder()
-            .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, hostname)
+            .set(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME, hostname)
             .build());
   }
 

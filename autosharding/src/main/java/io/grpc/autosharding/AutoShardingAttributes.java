@@ -17,7 +17,6 @@
 package io.grpc.autosharding;
 
 import io.grpc.Attributes;
-import io.grpc.EquivalentAddressGroup;
 import io.grpc.Internal;
 
 /**
@@ -30,17 +29,6 @@ import io.grpc.Internal;
  */
 @Internal
 public final class AutoShardingAttributes {
-
-  /**
-   * Hostname associated with an endpoint, as described in gRFC A81.
-   *
-   * <p>When absent, {@link EndpointMap} falls back to the string form of the endpoint's first
-   * address, per gRFC A119. The hostname is what assignments from the sharding service name
-   * their endpoints by, so it must match what that service reports.
-   */
-  @EquivalentAddressGroup.Attr
-  public static final Attributes.Key<String> ATTR_ENDPOINT_HOSTNAME =
-      Attributes.Key.create("io.grpc.autosharding.endpointHostname");
 
   /**
    * The "Channel Factory" used to create a channel to the sharding service.

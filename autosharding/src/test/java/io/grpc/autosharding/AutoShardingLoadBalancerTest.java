@@ -44,6 +44,7 @@ import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
+import io.grpc.InternalEquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.Helper;
 import io.grpc.LoadBalancer.PickDetailsConsumer;
@@ -835,7 +836,7 @@ public class AutoShardingLoadBalancerTest {
           new EquivalentAddressGroup(
               new NamedAddress("addr-" + hostname),
               Attributes.newBuilder()
-                  .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, hostname)
+                  .set(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME, hostname)
                   .build()));
     }
     return ImmutableList.copyOf(eags);
@@ -845,7 +846,7 @@ public class AutoShardingLoadBalancerTest {
     return new EquivalentAddressGroup(
         new NamedAddress("addr-" + hostname),
         Attributes.newBuilder()
-            .set(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME, hostname)
+            .set(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME, hostname)
             .set(EquivalentAddressGroup.ATTR_LOCALITY_NAME, locality)
             .build());
   }
@@ -1170,7 +1171,7 @@ public class AutoShardingLoadBalancerTest {
               .getAddresses()
               .get(0)
               .getAttributes()
-              .get(AutoShardingAttributes.ATTR_ENDPOINT_HOSTNAME);
+              .get(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME);
       return Status.OK;
     }
 
