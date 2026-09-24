@@ -206,6 +206,53 @@ public class AutoshardingClientTest {
   }
 
   @Test
+  public void generationZero_acceptedAsTheFirstAssignment() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
+    serverStream.onNext(metadataResponse(0));
+
+    assertThat(takeAssignment().getGeneration()).isEqualTo(0);
+    WatchShardingAssignmentRequest ack = takeRequest();
+    assertThat(ack.getAssignmentAck().getGeneration()).isEqualTo(0);
+    assertThat(ack.getAssignmentAck().getAccepted()).isTrue();
+  }
+
+  @Test
+  public void generationZero_resentAfterAcceptance_isStale() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
+    serverStream.onNext(metadataResponse(0));
+    takeAssignment();
+    takeRequest(); // ACK for generation 0
+
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-b", "", null, 0)));
+    serverStream.onNext(metadataResponse(0));
+
+    WatchShardingAssignmentRequest nack = takeRequest();
+    assertThat(nack.getAssignmentAck().getAccepted()).isFalse();
+    assertThat(nack.getAssignmentAck().getErrorMessage()).contains("stale generation");
+    assertThat(assignments).isEmpty();
+  }
+
+  @Test
+  public void negativeGeneration_acceptedAsTheFirstAssignment() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
+    serverStream.onNext(metadataResponse(-3));
+
+    assertThat(takeAssignment().getGeneration()).isEqualTo(-3);
+    assertThat(client.getLatestGeneration()).isEqualTo(-3);
+  }
+
+  @Test
   public void rejectedAssignment_doesNotLeakChunksIntoTheNextOne() throws Exception {
     start(client);
     takeRequest();

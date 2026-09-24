@@ -44,6 +44,7 @@ import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ConnectivityState;
 import io.grpc.EquivalentAddressGroup;
+import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
 import io.grpc.InternalEquivalentAddressGroup;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.Helper;
@@ -308,6 +309,17 @@ public class AutoShardingLoadBalancerTest {
     assertThat(channelFactory.isReleased(0)).isTrue();
     assertThat(channelFactory.isReleased(1)).isFalse();
     assertThat(service.streamCount.get()).isEqualTo(2);
+  }
+
+  @Test
+  public void changedKey_cancelsOldStreamBeforeReleasingOldChannel() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    takeRequest();
+
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, true), "a");
+
+    assertThat(channelFactory.isReleased(0)).isTrue();
+    assertThat(channelFactory.liveCallsAtRelease).containsExactly(0);
   }
 
   @Test
@@ -1125,9 +1137,13 @@ public class AutoShardingLoadBalancerTest {
       return channel;
     }
 
+    // Calls on each released channel that had not been cancelled when it was released.
+    final List<Integer> liveCallsAtRelease = new ArrayList<>();
+
     @Override
     public void releaseChannel(Channel channel) {
       released.add(channel);
+      liveCallsAtRelease.add(((WrappedChannel) channel).liveCalls);
     }
 
     boolean isReleased(int index) {
@@ -1144,6 +1160,8 @@ public class AutoShardingLoadBalancerTest {
   /** Gives each handle a distinct channel identity over one shared transport. */
   private static final class WrappedChannel extends Channel {
     private final Channel delegate;
+    // Calls created on this handle that the client has not cancelled.
+    int liveCalls;
 
     WrappedChannel(Channel delegate) {
       this.delegate = delegate;
@@ -1157,7 +1175,20 @@ public class AutoShardingLoadBalancerTest {
     @Override
     public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
         MethodDescriptor<ReqT, RespT> methodDescriptor, CallOptions callOptions) {
-      return delegate.newCall(methodDescriptor, callOptions);
+      liveCalls++;
+      return new SimpleForwardingClientCall<ReqT, RespT>(
+          delegate.newCall(methodDescriptor, callOptions)) {
+        private boolean cancelled;
+
+        @Override
+        public void cancel(@Nullable String message, @Nullable Throwable cause) {
+          if (!cancelled) {
+            cancelled = true;
+            liveCalls--;
+          }
+          super.cancel(message, cause);
+        }
+      };
     }
   }
 

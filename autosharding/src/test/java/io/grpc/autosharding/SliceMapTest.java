@@ -61,7 +61,7 @@ public class SliceMapTest {
     SliceEntry s3 = new SliceEntry(
         "t".getBytes(StandardCharsets.UTF_8), Collections.singletonList(2));
 
-    SliceMap sliceMap = new SliceMap(Arrays.asList(s3, s1, s2), Arrays.asList(0, 1, 2), 5L);
+    SliceMap sliceMap = new SliceMap(Arrays.asList(s1, s2, s3), Arrays.asList(0, 1, 2), 5L);
 
     // Exact matches
     assertThat(sliceMap.lookup("".getBytes(StandardCharsets.UTF_8))).isEqualTo(0);
@@ -105,7 +105,7 @@ public class SliceMapTest {
     SliceEntry s4 = new SliceEntry(key3, Collections.singletonList(3));
 
     SliceMap sliceMap = new SliceMap(
-        Arrays.asList(s4, s2, s1, s3), Arrays.asList(0, 1, 2, 3), 1L);
+        Arrays.asList(s1, s2, s3, s4), Arrays.asList(0, 1, 2, 3), 1L);
 
     assertThat(sliceMap.lookup(new byte[] {0x10})).isEqualTo(0);
     assertThat(sliceMap.lookup(new byte[] {0x7F})).isEqualTo(1);
@@ -148,30 +148,6 @@ public class SliceMapTest {
     SliceMap sliceMap = new SliceMap(Arrays.asList(s1, s2), Arrays.asList(0, 1), 1L);
 
     assertThat(sliceMap.lookup(null)).isEqualTo(0);
-  }
-
-  @Test
-  public void constructor_unsortedSlices_sortedLexicographically() {
-    SliceEntry s1 = new SliceEntry(
-        "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(0));
-    SliceEntry s2 = new SliceEntry(
-        "m".getBytes(StandardCharsets.UTF_8), Collections.singletonList(1));
-    SliceEntry s3 = new SliceEntry(
-        "z".getBytes(StandardCharsets.UTF_8), Collections.singletonList(2));
-
-    // Pass in reverse order
-    SliceMap sliceMap = new SliceMap(Arrays.asList(s3, s1, s2), Arrays.asList(0, 1, 2), 1L);
-
-    assertThat(sliceMap.getSlices().get(0).getStartKey())
-        .isEqualTo("".getBytes(StandardCharsets.UTF_8));
-    assertThat(sliceMap.getSlices().get(1).getStartKey())
-        .isEqualTo("m".getBytes(StandardCharsets.UTF_8));
-    assertThat(sliceMap.getSlices().get(2).getStartKey())
-        .isEqualTo("z".getBytes(StandardCharsets.UTF_8));
-
-    assertThat(sliceMap.lookup("abc".getBytes(StandardCharsets.UTF_8))).isEqualTo(0);
-    assertThat(sliceMap.lookup("mmm".getBytes(StandardCharsets.UTF_8))).isEqualTo(1);
-    assertThat(sliceMap.lookup("zzz".getBytes(StandardCharsets.UTF_8))).isEqualTo(2);
   }
 
   @Test

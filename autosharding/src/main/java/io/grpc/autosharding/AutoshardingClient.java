@@ -95,8 +95,17 @@ final class AutoshardingClient {
    * target changes: the stored value is meaningless against a different sharding server or a
    * different resource, and retaining it could cause the server to withhold assignments
    * indefinitely.
+   *
+   * <p>Zero until something is accepted, which the proto reads as "unset". Only meaningful once
+   * {@link #acceptedAnyGeneration} is set, since zero is also a legitimate generation.
    */
   private long latestGeneration;
+
+  /**
+   * Whether any assignment has been accepted. gRFC A119 only requires a generation to exceed
+   * previously accepted ones, so the first assignment is accepted whatever its generation.
+   */
+  private boolean acceptedAnyGeneration;
 
   @Nullable private BackoffPolicy retryBackoffPolicy;
   @Nullable private ScheduledHandle retryTimer;
@@ -311,7 +320,7 @@ final class AutoshardingClient {
 
       // Generations are monotonically increasing, so anything we have already accepted is stale.
       // It is still acknowledged, so that the server does not wait on a reply that never comes.
-      if (generation <= latestGeneration) {
+      if (acceptedAnyGeneration && generation <= latestGeneration) {
         String error =
             String.format(
                 "stale generation %s; %s has already been accepted", generation, latestGeneration);
@@ -344,6 +353,7 @@ final class AutoshardingClient {
       }
       sendAck(generation, true, result.errorMessage);
       latestGeneration = generation;
+      acceptedAnyGeneration = true;
       receivedGoodAssignment = true;
       watcher.onAssignment(result.assignment);
     }

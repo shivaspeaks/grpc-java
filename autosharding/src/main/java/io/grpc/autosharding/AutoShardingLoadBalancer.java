@@ -199,6 +199,7 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     List<EquivalentAddressGroup> endpoints = resolvedAddresses.getAddresses();
 
     Channel previousChannel = shardingChannel;
+    ChannelFactory previousFactory = channelFactory;
     Status channelStatus = updateShardingServiceChannel(factory, newConfig);
     if (!channelStatus.isOk()) {
       return channelStatus;
@@ -219,6 +220,12 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
         shardingChannel != previousChannel,
         resolveTarget(newConfig, resolvedAddresses.getAttributes()),
         newConfig.initialAssignmentTimeoutNanos);
+
+    // Only now that the old stream has been cancelled. Release through the factory that produced
+    // it, which is not necessarily the new one.
+    if (previousChannel != null && previousChannel != shardingChannel) {
+      previousFactory.releaseChannel(previousChannel);
+    }
 
     if (endpoints.isEmpty()) {
       // Any assignment is kept: it stays valid if the endpoints come back. Until they do,
@@ -286,7 +293,8 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
    * Creates a channel to the sharding service if this is the first configuration update, or if
    * the {@code channel_factory_key} or the factory itself changed. Leaves {@link #shardingChannel}
    * untouched when nothing changed, which is how the caller detects that no new channel was
-   * needed.
+   * needed. The previous channel is not released here: the caller does that once the stream on
+   * it has been cancelled.
    */
   private Status updateShardingServiceChannel(
       ChannelFactory factory, AutoShardingLoadBalancerConfig newConfig) {
@@ -308,10 +316,6 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
               + e.getMessage());
     }
 
-    // Release through the factory that produced it, which is not necessarily the new one.
-    if (shardingChannel != null) {
-      channelFactory.releaseChannel(shardingChannel);
-    }
     shardingChannel = newChannel;
     channelFactory = factory;
     return Status.OK;
