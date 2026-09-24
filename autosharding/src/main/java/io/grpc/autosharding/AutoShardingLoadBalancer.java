@@ -327,9 +327,10 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
    * and the resource it was learned from; carrying it over could make a different server withhold
    * assignments indefinitely.
    *
-   * <p>Creating a client also restarts the initial assignment timer, since the new one has to
-   * start from scratch. Any assignment carried over from the previous client keeps being served
-   * while that timer runs.
+   * <p>The initial assignment timer is restarted only when the channel changed, which gRFC A119
+   * ties it to. A target change on the same channel leaves the timer as it is: restarting it
+   * after the wait had already ended would take a policy serving in fallback back to queuing.
+   * Any assignment carried over from the previous client keeps being served either way.
    */
   private void maybeRecreateClient(boolean channelChanged, String newTarget, long timeoutNanos) {
     if (client != null && !channelChanged && newTarget.equals(shardingTarget)) {
@@ -349,8 +350,10 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
             shardingChannel,
             newTarget,
             new AssignmentWatcherImpl());
-    // Armed before the stream opens so that an assignment delivered right away cancels it.
-    startInitialAssignmentTimer(timeoutNanos);
+    if (channelChanged) {
+      // Armed before the stream opens so that an assignment delivered right away cancels it.
+      startInitialAssignmentTimer(timeoutNanos);
+    }
     client.start();
   }
 
@@ -427,22 +430,16 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
 
     @Override
     public void onError(Status error) {
-      if (shutdown) {
-        return;
-      }
-      if (assignment != null) {
-        // An assignment we can still use is in hand; the service only failed to replace it.
-        // Mirrors handleNameResolutionError: stale data beats no data.
-        logger.log(Level.WARNING, "Keeping the current sharding assignment: {0}", error);
-        return;
-      }
+      // Nothing changes. An assignment already in hand is still usable, and without one gRFC
+      // A119 keeps RPCs queued until a valid assignment arrives or the timer fires; a later
+      // generation on the same stream may well be good. If the timer has already fired, the
+      // picker is in fallback (or failing) and stays there.
       logger.log(
           Level.WARNING,
-          "The sharding service sent no usable assignment; proceeding {0} fallback: {1}",
-          new Object[] {config != null && config.enableFallback ? "with" : "without", error});
-      // Stop queuing RPCs: there is nothing left to wait for on this generation.
-      cancelInitialAssignmentTimer();
-      rebuildSliceMapAndPublish();
+          "The sharding service sent no usable assignment; {0}: {1}",
+          new Object[] {
+            assignment != null ? "keeping the current one" : "still waiting for one", error
+          });
     }
   }
 
@@ -504,21 +501,23 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       // acceptResolvedAddresses already reported TRANSIENT_FAILURE for this case.
       return;
     }
+    // The nudge below is keyed on the endpoints' aggregate, not on what is reported to the
+    // channel, so it is computed even while RPCs are queued for the initial assignment.
+    ConnectivityState state = endpointMap.aggregateConnectivityState();
     if (awaitingInitialAssignment && assignment == null) {
       helper.updateBalancingState(CONNECTING, ASSIGNMENT_PENDING_PICKER);
-      return;
+    } else {
+      helper.updateBalancingState(
+          state,
+          new AutoShardingPicker(
+              sliceMap, endpointMap.toPickerEndpoints(), config.enableFallback, keyHeader));
     }
-
-    ConnectivityState state = endpointMap.aggregateConnectivityState();
-    helper.updateBalancingState(
-        state,
-        new AutoShardingPicker(
-            sliceMap, endpointMap.toPickerEndpoints(), config.enableFallback, keyHeader));
 
     // Nothing else will drive progress: this policy only connects in response to picks, so a
     // CONNECTING or TRANSIENT_FAILURE aggregate could otherwise stick with no attempt in flight.
     // The woken endpoint reports CONNECTING synchronously, re-entering publishPicker() once to
     // publish the fresher picker; that pass finds an endpoint CONNECTING and wakes no one else.
+    // An all-IDLE aggregate is left alone, which is what keeps the policy lazy.
     if (state == CONNECTING || state == TRANSIENT_FAILURE) {
       endpointMap.maybeWakeUpIdleEndpoint();
     }

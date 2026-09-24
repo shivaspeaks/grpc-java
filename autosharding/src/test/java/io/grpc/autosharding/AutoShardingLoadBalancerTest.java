@@ -442,6 +442,28 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
+  public void beforeFirstAssignment_endpointInTransientFailure_stillWakesUpAnIdleEndpoint() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b", "c");
+
+    reportTransientFailure("a");
+
+    // RPCs stay queued, but the endpoint aggregate is CONNECTING with nothing connecting, so
+    // one IDLE endpoint is nudged exactly as it would be outside the wait.
+    assertThat(currentState).isEqualTo(CONNECTING);
+    assertThat(pick("k").getSubchannel()).isNull();
+    assertThat(childForHost("b").requestConnectionCount).isEqualTo(1);
+  }
+
+  @Test
+  public void beforeFirstAssignment_allEndpointsIdle_connectsNothing() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+
+    pick("k");
+
+    assertThat(childProvider.children).isEmpty();
+  }
+
+  @Test
   public void initialAssignmentTimeout_fallbackEnabled_spreadsAcrossAllEndpoints() {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
     reportReady("a");
@@ -491,43 +513,83 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
-  public void newClient_restartsTheInitialAssignmentTimer() throws Exception {
+  public void newChannel_restartsTheInitialAssignmentTimer() throws Exception {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
     deliverAssignment(1, slice("", "a"));
     assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
 
-    deliverAddresses(retargetedConfig("other-target"), "a");
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, true), "a");
 
-    // The replacement client has to learn an assignment from scratch, so it gets the full
-    // timeout rather than inheriting the exhausted one.
     assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
   }
 
   @Test
-  public void unusableAssignment_beforeAnyAssignment_stopsQueuingAndFallsBack() throws Exception {
-    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
-    reportReady("a");
-    reportReady("b");
-    assertThat(currentState).isEqualTo(CONNECTING);
+  public void changedTarget_doesNotRestartTheInitialAssignmentTimer() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    deliverAssignment(1, slice("", "a"));
 
-    pushUnusableAssignment(1);
+    deliverAddresses(retargetedConfig("other-target"), "a");
 
-    assertThat(currentState).isEqualTo(READY);
-    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
     assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
   }
 
   @Test
-  public void unusableAssignment_beforeAnyAssignment_fallbackDisabled_failsRpcs()
-      throws Exception {
-    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+  public void changedTarget_inFallback_keepsServingInsteadOfQueuing() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
     reportReady("a");
+    reportReady("b");
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
+
+    deliverAddresses(retargetedConfig("other-target"), "a", "b");
+
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
+  }
+
+  @Test
+  public void changedTarget_whileTimerPending_keepsTheOriginalDeadline() {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
+    reportReady("a");
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS - 1);
+
+    deliverAddresses(retargetedConfig("other-target"), "a");
+    assertThat(pick("k").getSubchannel()).isNull();
+    fakeClock.forwardNanos(1);
+
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  @Test
+  public void unusableAssignment_beforeAnyAssignment_keepsQueuingUntilTimeout() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    reportReady("a");
+    reportReady("b");
 
     pushUnusableAssignment(1);
 
-    PickResult result = pick("k");
-    assertThat(result.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
-    assertThat(result.getStatus().getDescription()).contains("fallback disabled");
+    assertThat(currentState).isEqualTo(CONNECTING);
+    assertThat(pick("k").getSubchannel()).isNull();
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
+  }
+
+  @Test
+  public void unusableAssignment_thenGoodOneBeforeTimeout_usesTheGoodOne() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    reportReady("a");
+    reportReady("b");
+
+    pushUnusableAssignment(1);
+    deliverAssignment(2, slice("", "a"), slice("m", "b"));
+
+    assertThat(pickedHost(pick("alpha"))).isEqualTo("a");
+    assertThat(pickedHost(pick("zulu"))).isEqualTo("b");
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
   }
 
   @Test
