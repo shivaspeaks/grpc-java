@@ -38,5 +38,5 @@ public final class InternalEquivalentAddressGroup {
    */
   @EquivalentAddressGroup.Attr
   public static final Attributes.Key<String> ATTR_ADDRESS_NAME =
-      Attributes.Key.create("io.grpc.EquivalentAddressGroup.ATTR_ADDRESS_NAME");
+      Attributes.Key.create("io.grpc.InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME");
 }
