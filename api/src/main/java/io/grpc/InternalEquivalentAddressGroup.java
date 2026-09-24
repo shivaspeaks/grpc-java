@@ -36,6 +36,7 @@ public final class InternalEquivalentAddressGroup {
   /**
    * Name associated with individual address, if available (e.g., DNS name).
    */
+  @EquivalentAddressGroup.Attr
   public static final Attributes.Key<String> ATTR_ADDRESS_NAME =
-      EquivalentAddressGroup.ATTR_ADDRESS_NAME;
+      Attributes.Key.create("io.grpc.EquivalentAddressGroup.ATTR_ADDRESS_NAME");
 }
