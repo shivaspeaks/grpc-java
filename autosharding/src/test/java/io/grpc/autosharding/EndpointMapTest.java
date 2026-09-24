@@ -425,6 +425,44 @@ public class EndpointMapTest {
     assertThat(childProvider.children.get(0).shutdown).isTrue();
   }
 
+  @Test
+  public void shutdown_childReportingWhileShuttingDown_doesNotNotifyListener() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+    childProvider.reportOnShutdown = true;
+    stateUpdates.clear();
+
+    endpointMap.shutdown();
+
+    assertThat(stateUpdates).isEmpty();
+  }
+
+  @Test
+  public void shutdown_childReportingAfterShutdown_doesNotNotifyListener() {
+    endpointMap.updateEndpoints(endpoints("a"), Attributes.EMPTY);
+    activate(0);
+    FakeChild child = childProvider.children.get(0);
+    endpointMap.shutdown();
+    stateUpdates.clear();
+
+    child.report(READY, mock(SubchannelPicker.class));
+
+    assertThat(stateUpdates).isEmpty();
+  }
+
+  @Test
+  public void updateEndpoints_removedChildReportingWhileShuttingDown_doesNotNotifyListener() {
+    endpointMap.updateEndpoints(endpoints("a", "b"), Attributes.EMPTY);
+    activate(0);
+    childProvider.reportOnShutdown = true;
+    stateUpdates.clear();
+
+    endpointMap.updateEndpoints(endpoints("b"), Attributes.EMPTY);
+
+    assertThat(childProvider.children.get(0).shutdown).isTrue();
+    assertThat(stateUpdates).isEmpty();
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------------------------
@@ -521,6 +559,7 @@ public class EndpointMapTest {
 
     /** Run from every child's {@code acceptResolvedAddresses}, to exercise re-entrancy. */
     Runnable onAccept;
+    boolean reportOnShutdown;
 
     @Override
     public boolean isAvailable() {
@@ -581,6 +620,9 @@ public class EndpointMapTest {
     @Override
     public void shutdown() {
       shutdown = true;
+      if (provider.reportOnShutdown) {
+        report(TRANSIENT_FAILURE, new FixedResultPicker(PickResult.withNoResult()));
+      }
     }
 
     void report(ConnectivityState state, SubchannelPicker picker) {

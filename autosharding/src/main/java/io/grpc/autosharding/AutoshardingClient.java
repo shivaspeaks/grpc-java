@@ -302,6 +302,8 @@ final class AutoshardingClient {
         bufferedChunks.add(response.getChunk());
       } else if (response.hasMetadata()) {
         handleAssignmentComplete(response.getMetadata().getGeneration());
+      } else if (!response.hasConfig()) {
+        logger.log(Level.FINE, "Ignoring autosharding response with no field set");
       }
       // LoadReportingConfig is intentionally ignored; load reporting is not yet supported.
     }

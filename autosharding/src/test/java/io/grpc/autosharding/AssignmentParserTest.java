@@ -541,6 +541,43 @@ public class AssignmentParserTest {
     assertThat(result.errorMessage).contains("...");
   }
 
+  @Test
+  public void parse_sliceAssignmentWithoutSlice_isDroppedNotTreatedAsWholeKeyspace() {
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addEndpoints(endpoint("host-a"))
+            .addEndpoints(endpoint("host-b"))
+            .addSliceAssignments(sliceAssignment("", "m", 0))
+            // No slice set; its default would read as ["", inf) and overlap everything.
+            .addSliceAssignments(
+                SliceAssignment.newBuilder()
+                    .addEndpoints(PerSliceEndpointState.newBuilder().setEndpointIndex(1)))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    assertThat(result.errorMessage).contains("no slice");
+    assertThat(result.assignment).isNotNull();
+    assertSlice(result.assignment.getSlices().get(0), "", "m", 0);
+    assertSlice(result.assignment.getSlices().get(1), "m", null);
+  }
+
+  @Test
+  public void parse_onlySliceAssignmentWithoutSlice_isUnusable() {
+    AssignmentChunk chunk =
+        AssignmentChunk.newBuilder()
+            .addEndpoints(endpoint("host-a"))
+            .addSliceAssignments(
+                SliceAssignment.newBuilder()
+                    .addEndpoints(PerSliceEndpointState.newBuilder().setEndpointIndex(0)))
+            .build();
+
+    AssignmentParser.Result result = AssignmentParser.parse(ImmutableList.of(chunk), 1);
+
+    assertThat(result.assignment).isNull();
+    assertThat(result.errorMessage).contains("no slice");
+  }
+
   /** Parses chunks that are expected to be usable in their entirety. */
   private static Assignment parseFully(List<AssignmentChunk> chunks, long generation) {
     AssignmentParser.Result result = AssignmentParser.parse(chunks, generation);

@@ -479,7 +479,7 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       fallbackPool.add(i);
     }
     if (assignment == null) {
-      return new SliceMap(ImmutableList.of(), fallbackPool, 0);
+      return new SliceMap(ImmutableList.of(), fallbackPool);
     }
 
     ImmutableList<String> endpointNames = assignment.getEndpointNames();
@@ -494,7 +494,7 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       }
       entries.add(new SliceMap.SliceEntry(slice.getStartKey(), indices));
     }
-    return new SliceMap(entries, fallbackPool, assignment.getGeneration());
+    return new SliceMap(entries, fallbackPool);
   }
 
   private void publishPicker() {

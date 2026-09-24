@@ -74,7 +74,7 @@ public class AutoShardingPickerTest {
         ConnectivityState.READY, new FakePicker(readyResult), NOOP_EXIT_IDLER);
 
     SliceMap emptySliceMap = new SliceMap(
-        Collections.emptyList(), Collections.singletonList(0), 1L);
+        Collections.emptyList(), Collections.singletonList(0));
     AutoShardingPicker picker = new AutoShardingPicker(
         emptySliceMap,
         Collections.singletonList(ep0),
@@ -95,7 +95,7 @@ public class AutoShardingPickerTest {
         ConnectivityState.READY, new FakePicker(PickResult.withNoResult()), NOOP_EXIT_IDLER);
 
     SliceMap emptySliceMap = new SliceMap(
-        Collections.emptyList(), Collections.singletonList(0), 1L);
+        Collections.emptyList(), Collections.singletonList(0));
     AutoShardingPicker picker = new AutoShardingPicker(
         emptySliceMap,
         Collections.singletonList(ep0),
@@ -119,7 +119,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(0));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice), Collections.singletonList(0), 1L);
+        Collections.singletonList(slice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -146,7 +146,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(0));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice), Collections.singletonList(0), 1L);
+        Collections.singletonList(slice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -171,7 +171,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(0));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice), Collections.singletonList(0), 1L);
+        Collections.singletonList(slice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -200,7 +200,7 @@ public class AutoShardingPickerTest {
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(0));
     // Fallback pool has ep1 (which is ready)
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice0), Collections.singletonList(1), 1L);
+        Collections.singletonList(slice0), Collections.singletonList(1));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -223,7 +223,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice0 = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(0));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice0), Collections.singletonList(0), 1L);
+        Collections.singletonList(slice0), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -247,7 +247,7 @@ public class AutoShardingPickerTest {
 
     SliceEntry s0 = new SliceEntry(new byte[] {0x00}, Collections.singletonList(0));
     SliceEntry s1 = new SliceEntry(new byte[] {0x50}, Collections.singletonList(1));
-    SliceMap sliceMap = new SliceMap(Arrays.asList(s0, s1), Arrays.asList(0, 1), 1L);
+    SliceMap sliceMap = new SliceMap(Arrays.asList(s0, s1), Arrays.asList(0, 1));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -272,7 +272,7 @@ public class AutoShardingPickerTest {
     SliceEntry emptySlice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.emptyList());
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(emptySlice), Collections.singletonList(0), 1L);
+        Collections.singletonList(emptySlice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -297,7 +297,7 @@ public class AutoShardingPickerTest {
         "".getBytes(StandardCharsets.UTF_8), Collections.emptyList());
     // Fallback pool has ep0
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(gapSlice), Collections.singletonList(0), 1L);
+        Collections.singletonList(gapSlice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -318,7 +318,7 @@ public class AutoShardingPickerTest {
     SliceEntry emptySlice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.emptyList());
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(emptySlice), Collections.emptyList(), 1L);
+        Collections.singletonList(emptySlice), Collections.emptyList());
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -379,7 +379,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Arrays.asList(0, 1));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice), Arrays.asList(0, 1), 1L);
+        Collections.singletonList(slice), Arrays.asList(0, 1));
 
     // Test picking index 0
     AutoShardingPicker picker0 = new AutoShardingPicker(
@@ -411,7 +411,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(5));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice), Collections.singletonList(0), 1L);
+        Collections.singletonList(slice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -433,7 +433,7 @@ public class AutoShardingPickerTest {
     SliceEntry slice = new SliceEntry(
         "".getBytes(StandardCharsets.UTF_8), Collections.singletonList(-1));
     SliceMap sliceMap = new SliceMap(
-        Collections.singletonList(slice), Collections.singletonList(0), 1L);
+        Collections.singletonList(slice), Collections.singletonList(0));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         sliceMap,
@@ -453,7 +453,7 @@ public class AutoShardingPickerTest {
 
     // Fallback pool references index 10, but only 1 endpoint exists
     SliceMap emptySliceMap = new SliceMap(
-        Collections.emptyList(), Collections.singletonList(10), 1L);
+        Collections.emptyList(), Collections.singletonList(10));
 
     AutoShardingPicker picker = new AutoShardingPicker(
         emptySliceMap,
@@ -469,7 +469,7 @@ public class AutoShardingPickerTest {
   @Test
   public void constructor_nullInputs_throwsNullPointerException() {
     SliceMap sliceMap = new SliceMap(
-        Collections.emptyList(), Collections.emptyList(), 1L);
+        Collections.emptyList(), Collections.emptyList());
 
     Assert.assertThrows(
         NullPointerException.class,

@@ -38,6 +38,7 @@ import javax.annotation.Nullable;
  * is usable only if all of the following hold:
  *
  * <ul>
+ *   <li>its {@code SliceAssignment} actually carries a {@code slice};
  *   <li>its {@code startKey} is strictly less than its {@code endKey}, or it has no
  *       {@code endKey} and so runs to the end of the keyspace;
  *   <li>every endpoint index it references is valid once the endpoint names from all chunks are
@@ -158,6 +159,11 @@ final class AssignmentParser {
     List<Assignment.Slice> slices = new ArrayList<>();
     for (AssignmentChunk chunk : chunks) {
       for (SliceAssignment sliceAssignment : chunk.getSliceAssignmentsList()) {
+        if (!sliceAssignment.hasSlice()) {
+          // The default Slice reads as ["", inf), which would claim or overlap the whole keyspace.
+          dropped.add("slice assignment has no slice");
+          continue;
+        }
         com.google.cloud.autosharding.v1.Slice slice = sliceAssignment.getSlice();
         byte[] startKey = slice.getStartKey().toByteArray();
         byte[] endKey = slice.hasEndKey() ? slice.getEndKey().toByteArray() : null;

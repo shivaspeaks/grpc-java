@@ -394,6 +394,9 @@ final class EndpointMap {
       if (childShutdown) {
         return;
       }
+      // Set before shutting the child down: a child may report from inside its own shutdown(),
+      // and this flag is what keeps that report away from the listener, both here and for the
+      // endpoints updateEndpoints() removes before it sets rebuilding.
       childShutdown = true;
       childLb.shutdown();
     }
