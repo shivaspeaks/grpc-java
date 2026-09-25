@@ -60,6 +60,7 @@ public class AutoshardingClientTest {
   private static final String OTHER_TARGET = "other-autosharding-target";
   private static final long TIMEOUT_SECONDS = 5;
   private static final long BACKOFF_NANOS = TimeUnit.SECONDS.toNanos(1);
+  private static final long ASSIGNMENT_TIMEOUT_NANOS = TimeUnit.MINUTES.toNanos(1);
 
   @Rule public final GrpcCleanupRule grpcCleanup = new GrpcCleanupRule();
 
@@ -358,7 +359,7 @@ public class AutoshardingClientTest {
 
     takeServerStream().onError(Status.UNAVAILABLE.asRuntimeException());
 
-    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+    assertThat(numPendingRetries()).isEqualTo(1);
     fakeClock.forwardNanos(BACKOFF_NANOS - 1);
     assertThat(service.streamCount.get()).isEqualTo(1);
 
@@ -438,6 +439,82 @@ public class AutoshardingClientTest {
   }
 
   @Test
+  public void initialAssignmentTimer_reportsAnErrorWhenItFires() throws Exception {
+    start(client);
+    takeRequest();
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS - 1);
+    assertThat(errors).isEmpty();
+
+    fakeClock.forwardNanos(1);
+    Status error = takeError();
+    assertThat(error.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(error.getDescription()).contains("timed out waiting for the initial assignment");
+  }
+
+  @Test
+  public void initialAssignmentTimer_cancelledByTheFirstAssignment() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
+    serverStream.onNext(metadataResponse(1));
+    takeAssignment();
+
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+    assertThat(errors).isEmpty();
+  }
+
+  @Test
+  public void initialAssignmentTimer_notCancelledByARejectedAssignment() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 3)));
+    serverStream.onNext(metadataResponse(1));
+    takeError();
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+    assertThat(takeError().getDescription()).contains("timed out");
+  }
+
+  @Test
+  public void streamFailure_beforeAnyAssignment_reportsAnError() throws Exception {
+    start(client);
+    takeRequest();
+
+    takeServerStream().onError(Status.PERMISSION_DENIED.withDescription("nope").asException());
+
+    Status error = takeError();
+    assertThat(error.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(error.getDescription()).contains("stream failed: PERMISSION_DENIED: nope");
+  }
+
+  @Test
+  public void errorsAfterTheFirstAssignment_notReported() throws Exception {
+    start(client);
+    takeRequest();
+    StreamObserver<WatchShardingAssignmentResponse> serverStream = takeServerStream();
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 0)));
+    serverStream.onNext(metadataResponse(1));
+    takeAssignment();
+    takeRequest(); // ACK
+
+    // A rejected assignment.
+    serverStream.onNext(chunkResponse(chunkWithEndpoint("host-a", "", null, 3)));
+    serverStream.onNext(metadataResponse(2));
+    takeRequest(); // NACK
+    // A stream failure, and the same on the retried stream.
+    serverStream.onError(Status.UNAVAILABLE.asRuntimeException());
+    fireRetryTimer();
+    takeRequest();
+    takeServerStream().onError(Status.UNAVAILABLE.asRuntimeException());
+
+    assertThat(errors).isEmpty();
+  }
+
+  @Test
   public void shutdown_cancelsStreamAndStopsReconnecting() throws Exception {
     start(client);
     takeRequest();
@@ -490,6 +567,7 @@ public class AutoshardingClientTest {
             fakeClock.getStopwatchSupplier(),
             channel,
             target,
+            ASSIGNMENT_TIMEOUT_NANOS,
             new RecordingWatcher());
     clients.add(created);
     return created;
@@ -501,8 +579,22 @@ public class AutoshardingClientTest {
 
   /** Asserts that a retry was scheduled and advances the clock so that it runs. */
   private void fireRetryTimer() {
-    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+    assertThat(numPendingRetries()).isEqualTo(1);
     fakeClock.forwardNanos(BACKOFF_NANOS);
+  }
+
+  /**
+   * Pending tasks other than the initial assignment timer, which is always much further out than
+   * a retry in these tests.
+   */
+  private int numPendingRetries() {
+    int count = 0;
+    for (FakeClock.ScheduledTask task : fakeClock.getPendingTasks()) {
+      if (task.getDelay(TimeUnit.NANOSECONDS) <= BACKOFF_NANOS) {
+        count++;
+      }
+    }
+    return count;
   }
 
   private WatchShardingAssignmentRequest takeRequest() throws Exception {

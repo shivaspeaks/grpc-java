@@ -34,7 +34,6 @@ import io.grpc.LoadBalancerRegistry;
 import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
-import io.grpc.SynchronizationContext.ScheduledHandle;
 import io.grpc.internal.BackoffPolicy;
 import io.grpc.internal.ExponentialBackoffPolicy;
 import io.grpc.internal.GrpcUtil;
@@ -42,7 +41,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -70,12 +68,13 @@ import javax.annotation.Nullable;
  *
  * <h3>Startup</h3>
  *
- * <p>Creating an {@link AutoshardingClient} starts the initial assignment timer. Until the first
- * assignment arrives or that timer fires, RPCs are queued. Once the timer fires without an
- * assignment, RPCs either spread across every resolved endpoint or fail outright, depending on
- * {@code enable_fallback}. A new client is created whenever the channel factory key or the
- * sharding target changes; an assignment carried over from the previous client keeps being used
- * while the timer runs, so a change of sharding service does not interrupt traffic.
+ * <p>Each {@link AutoshardingClient} reports either valid assignments or, until it has reported
+ * one, errors (including its initial assignment timer firing). Until the first report RPCs are
+ * queued. After an error, RPCs either spread across every resolved endpoint or fail with that
+ * error, depending on {@code enable_fallback}. A new client is created whenever the channel
+ * factory key or the sharding target changes; whatever the previous client last reported keeps
+ * being used until the new one reports, so a change of sharding service does not interrupt
+ * traffic. A failure to create the channel is handled like an error from the client.
  *
  * <h3>Threading model</h3>
  *
@@ -124,20 +123,21 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
 
   @Nullable private AutoshardingClient client;
 
-  /** Most recent assignment accepted from the sharding service, retained across reconnects. */
+  /**
+   * Most recent assignment reported by an {@link AutoshardingClient}. Survives client
+   * replacement, and is cleared only when a client reports an error instead.
+   */
   @Nullable private Assignment assignment;
+
+  /**
+   * Most recent error reported by an {@link AutoshardingClient}, or the failure to create the
+   * channel for one. Never set together with {@link #assignment}; with both null, nothing has
+   * been reported yet and RPCs are queued.
+   */
+  @Nullable private Status clientError;
 
   /** Join of {@link #assignment} and {@link #endpointMap}; null only before the first update. */
   @Nullable private SliceMap sliceMap;
-
-  @Nullable private ScheduledHandle initialAssignmentTimer;
-
-  /**
-   * True from the moment an {@link AutoshardingClient} is created until either an assignment
-   * arrives from it or {@link #initialAssignmentTimer} fires. Combined with a null
-   * {@link #assignment} it means RPCs must be queued rather than failed.
-   */
-  private boolean awaitingInitialAssignment;
 
   private boolean shutdown;
 
@@ -201,9 +201,6 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     Channel previousChannel = shardingChannel;
     ChannelFactory previousFactory = channelFactory;
     Status channelStatus = updateShardingServiceChannel(factory, newConfig);
-    if (!channelStatus.isOk()) {
-      return channelStatus;
-    }
 
     if (config == null || !config.keyHeaderName.equals(newConfig.keyHeaderName)) {
       keyHeader = AutoShardingPicker.createKeyHeader(newConfig.keyHeaderName);
@@ -214,12 +211,19 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     // to endpoints the resolver has retracted.
     endpointMap.updateEndpoints(endpoints, resolvedAddresses.getAttributes());
 
-    // The locality arrives in the resolver attributes, so the target can change even when the
-    // config did not.
-    maybeRecreateClient(
-        shardingChannel != previousChannel,
-        resolveTarget(newConfig, resolvedAddresses.getAttributes()),
-        newConfig.initialAssignmentTimeoutNanos);
+    if (channelStatus.isOk()) {
+      // The locality arrives in the resolver attributes, so the target can change even when the
+      // config did not.
+      maybeRecreateClient(
+          shardingChannel != previousChannel,
+          resolveTarget(newConfig, resolvedAddresses.getAttributes()),
+          newConfig.initialAssignmentTimeoutNanos);
+    } else {
+      // Handled like an error from the client: RPCs go to fallback or fail with this status.
+      shutdownClient();
+      assignment = null;
+      clientError = channelStatus;
+    }
 
     // Only now that the old stream has been cancelled. Release through the factory that produced
     // it, which is not necessarily the new one.
@@ -234,7 +238,9 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     }
 
     rebuildSliceMapAndPublish();
-    return Status.OK;
+    // A failed channel is reported back too, so that the resolver refreshes and the next update
+    // retries creating it.
+    return channelStatus;
   }
 
   @Override
@@ -246,11 +252,11 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     // only reported when we are not already serving with them. Reporting it in that case is what
     // makes a broken resolver visible; otherwise RPCs would fail with whatever the stale
     // endpoints happen to be failing with, which names the wrong cause.
-    // The one addition is the initial assignment wait: RPCs queue until the timer
-    // fires, so a failed refresh must not turn that queue into failures.
-    boolean queueingForInitialAssignment = awaitingInitialAssignment && assignment == null;
+    // The one addition is the wait for the sharding service: RPCs queue until a client reports
+    // an assignment or an error, so a failed refresh must not turn that queue into failures.
+    boolean queueingForAssignment = assignment == null && clientError == null;
     if (endpointMap.size() > 0
-        && (queueingForInitialAssignment
+        && (queueingForAssignment
             || endpointMap.aggregateConnectivityState() == ConnectivityState.READY)) {
       logger.log(Level.FINE, "Ignoring name resolution error, still serving: {0}", error);
       return;
@@ -275,12 +281,7 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       return;
     }
     shutdown = true;
-    cancelInitialAssignmentTimer();
-    if (client != null) {
-      client.shutdown();
-      client = null;
-    }
-    shardingTarget = null;
+    shutdownClient();
     if (shardingChannel != null) {
       channelFactory.releaseChannel(shardingChannel);
       shardingChannel = null;
@@ -290,11 +291,12 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
   }
 
   /**
-   * Creates a channel to the sharding service if this is the first configuration update, or if
-   * the {@code channel_factory_key} or the factory itself changed. Leaves {@link #shardingChannel}
-   * untouched when nothing changed, which is how the caller detects that no new channel was
-   * needed. The previous channel is not released here: the caller does that once the stream on
-   * it has been cancelled.
+   * Creates a channel to the sharding service if this is the first configuration update, if the
+   * {@code channel_factory_key} or the factory itself changed, or if the previous attempt failed.
+   * Leaves {@link #shardingChannel} untouched when nothing changed, which is how the caller
+   * detects that no new channel was needed. On failure it is set to null and the error returned.
+   * The previous channel is not released here: the caller does that once the stream on it has
+   * been cancelled.
    */
   private Status updateShardingServiceChannel(
       ChannelFactory factory, AutoShardingLoadBalancerConfig newConfig) {
@@ -309,11 +311,15 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
       newChannel = factory.createChannel(newConfig.channelFactoryKey);
     } catch (RuntimeException e) {
       logger.log(Level.WARNING, "Failed to create a channel to the sharding service", e);
-      return failPermanently(
-          "autosharding: channel factory rejected key '"
-              + newConfig.channelFactoryKey
-              + "': "
-              + e.getMessage());
+      shardingChannel = null;
+      channelFactory = null;
+      return Status.UNAVAILABLE
+          .withDescription(
+              "autosharding: channel factory rejected key '"
+                  + newConfig.channelFactoryKey
+                  + "': "
+                  + e.getMessage())
+          .withCause(e);
     }
 
     shardingChannel = newChannel;
@@ -331,10 +337,8 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
    * and the resource it was learned from; carrying it over could make a different server withhold
    * assignments indefinitely.
    *
-   * <p>The initial assignment timer is restarted only when the channel changed, which gRFC A119
-   * ties it to. A target change on the same channel leaves the timer as it is: restarting it
-   * after the wait had already ended would take a policy serving in fallback back to queuing.
-   * Any assignment carried over from the previous client keeps being served either way.
+   * <p>Each new client starts its own initial assignment timer. Whatever the previous client
+   * reported keeps being served until the new one reports.
    */
   private void maybeRecreateClient(boolean channelChanged, String newTarget, long timeoutNanos) {
     if (client != null && !channelChanged && newTarget.equals(shardingTarget)) {
@@ -353,11 +357,8 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
             stopwatchSupplier,
             shardingChannel,
             newTarget,
+            timeoutNanos,
             new AssignmentWatcherImpl());
-    if (channelChanged) {
-      // Armed before the stream opens so that an assignment delivered right away cancels it.
-      startInitialAssignmentTimer(timeoutNanos);
-    }
     client.start();
   }
 
@@ -381,45 +382,21 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     return config.autoshardingTarget.replace("%s", locality == null ? "" : locality);
   }
 
-  private void startInitialAssignmentTimer(long timeoutNanos) {
-    cancelInitialAssignmentTimer();
-    awaitingInitialAssignment = true;
-    initialAssignmentTimer =
-        syncContext.schedule(
-            this::onInitialAssignmentTimeout, timeoutNanos, TimeUnit.NANOSECONDS, timeService);
-  }
-
-  private void cancelInitialAssignmentTimer() {
-    if (initialAssignmentTimer != null) {
-      initialAssignmentTimer.cancel();
-      initialAssignmentTimer = null;
+  private void shutdownClient() {
+    if (client != null) {
+      client.shutdown();
+      client = null;
     }
-    awaitingInitialAssignment = false;
+    shardingTarget = null;
   }
 
   /**
-   * Gives up on hearing from the sharding service. Any queued RPCs are retried against whatever
-   * the current configuration allows: the full endpoint set if fallback is enabled, otherwise a
-   * failing picker.
-   */
-  private void onInitialAssignmentTimeout() {
-    logger.log(
-        Level.WARNING,
-        "Timed out waiting for the initial assignment from the sharding service; "
-            + "proceeding {0} fallback",
-        config != null && config.enableFallback ? "with" : "without");
-    awaitingInitialAssignment = false;
-    initialAssignmentTimer = null;
-    rebuildSliceMapAndPublish();
-  }
-
-  /**
-   * Receives assignments from the current {@link AutoshardingClient}. Both callbacks arrive on
-   * the synchronization context.
+   * Receives what the current {@link AutoshardingClient} reports. Both callbacks arrive on the
+   * synchronization context.
    *
    * <p>A client that has been replaced cannot deliver anything, because {@link
-   * AutoshardingClient#shutdown()} closes its stream, so there is no need to check which client a
-   * callback came from.
+   * AutoshardingClient#shutdown()} closes its stream and cancels its timer, so there is no need to
+   * check which client a callback came from.
    */
   private final class AssignmentWatcherImpl implements AutoshardingClient.AssignmentWatcher {
     @Override
@@ -428,22 +405,24 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
         return;
       }
       assignment = newAssignment;
-      cancelInitialAssignmentTimer();
+      clientError = null;
       rebuildSliceMapAndPublish();
     }
 
     @Override
     public void onError(Status error) {
-      // Nothing changes. An assignment already in hand is still usable, and without one gRFC
-      // A119 keeps RPCs queued until a valid assignment arrives or the timer fires; a later
-      // generation on the same stream may well be good. If the timer has already fired, the
-      // picker is in fallback (or failing) and stays there.
+      if (shutdown) {
+        return;
+      }
+      // A client only reports errors before it has reported an assignment, so an assignment in
+      // hand here came from a previous client. The new client's state replaces it.
       logger.log(
           Level.WARNING,
-          "The sharding service sent no usable assignment; {0}: {1}",
-          new Object[] {
-            assignment != null ? "keeping the current one" : "still waiting for one", error
-          });
+          "No assignment from the sharding service; proceeding {0} fallback: {1}",
+          new Object[] {config != null && config.enableFallback ? "with" : "without", error});
+      assignment = null;
+      clientError = error;
+      rebuildSliceMapAndPublish();
     }
   }
 
@@ -508,8 +487,13 @@ final class AutoShardingLoadBalancer extends LoadBalancer {
     // The nudge below is keyed on the endpoints' aggregate, not on what is reported to the
     // channel, so it is computed even while RPCs are queued for the initial assignment.
     ConnectivityState state = endpointMap.aggregateConnectivityState();
-    if (awaitingInitialAssignment && assignment == null) {
+    if (assignment == null && clientError == null) {
       helper.updateBalancingState(CONNECTING, ASSIGNMENT_PENDING_PICKER);
+    } else if (assignment == null && !config.enableFallback) {
+      // No endpoint can be picked, so there is nothing to connect for either.
+      helper.updateBalancingState(
+          TRANSIENT_FAILURE, new FixedResultPicker(PickResult.withError(clientError)));
+      return;
     } else {
       helper.updateBalancingState(
           state,

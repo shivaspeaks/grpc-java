@@ -47,7 +47,12 @@ public interface ChannelFactory {
    * <p>The caller must pass the returned channel to {@link #releaseChannel} exactly once when it
    * is done with it.
    *
-   * @throws IllegalArgumentException if the key is not recognized
+   * <p>Failure is reported by throwing, for a key that is not recognized or not allowed as well as
+   * for any other reason the channel cannot be created. The LB policy then enters fallback or
+   * fails RPCs, as it would for an error from the sharding service.
+   *
+   * @throws IllegalArgumentException if the key is not recognized or not allowed
+   * @throws RuntimeException if the channel cannot be created for any other reason
    */
   Channel createChannel(String channelFactoryKey);
 

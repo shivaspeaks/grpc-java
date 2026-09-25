@@ -65,15 +65,19 @@ final class AutoshardingClient {
   /** The limit {@code autosharding.proto} places on {@code AssignmentAck.error_message}. */
   private static final int MAX_ERROR_MESSAGE_CODE_POINTS = 512;
 
-  /** Receives validated assignments from the autosharding service. */
+  /**
+   * Receives the state this client reports: valid assignments, or an error while it has none.
+   * Both callbacks are invoked on the {@link SynchronizationContext}.
+   */
   interface AssignmentWatcher {
-    /** Called with a newly accepted assignment. Invoked on the sync context. */
+    /** Called with a newly accepted assignment. */
     void onAssignment(Assignment assignment);
 
     /**
-     * Called when the sharding service sent an assignment that could not be used at all, meaning
-     * every slice in it failed validation. Any assignment already in use remains valid; this
-     * reports that it could not be replaced. Invoked on the {@link SynchronizationContext}.
+     * Called when this client has no valid assignment to offer: its stream failed, the sharding
+     * service sent an assignment with no usable slice, or the initial assignment timer fired.
+     * Never called once this client has reported an assignment, since the load balancer keeps
+     * using that one.
      */
     void onError(Status error);
   }
@@ -86,6 +90,7 @@ final class AutoshardingClient {
   private final String clientUuid;
   private final Channel channel;
   private final String target;
+  private final long initialAssignmentTimeoutNanos;
 
   /**
    * Generation of the most recent accepted assignment. Sent to the server so that it can skip
@@ -102,13 +107,15 @@ final class AutoshardingClient {
   private long latestGeneration;
 
   /**
-   * Whether any assignment has been accepted. gRFC A119 only requires a generation to exceed
-   * previously accepted ones, so the first assignment is accepted whatever its generation.
+   * Whether any assignment has been accepted, and so reported to the watcher. gRFC A119 only
+   * requires a generation to exceed previously accepted ones, so the first assignment is accepted
+   * whatever its generation. Once set, errors are no longer reported.
    */
   private boolean acceptedAnyGeneration;
 
   @Nullable private BackoffPolicy retryBackoffPolicy;
   @Nullable private ScheduledHandle retryTimer;
+  @Nullable private ScheduledHandle initialAssignmentTimer;
   @Nullable private AutoshardingStream stream;
   private boolean shutdown;
 
@@ -118,13 +125,15 @@ final class AutoshardingClient {
    * @param clientUuid a UUID generated once by the parent load balancer and reused across all
    *     stream restarts
    * @param syncContext the context on which all state is mutated and callbacks are delivered
-   * @param timerService used to schedule stream retries
+   * @param timerService used to schedule stream retries and the initial assignment timer
    * @param backoffPolicyProvider supplies the exponential backoff sequence for stream retries
    * @param stopwatchSupplier supplies the stopwatch measuring time spent in a stream attempt
    * @param channel the channel to the sharding service, created via the "Channel Factory" and
    *     owned by the parent load balancer
    * @param target the autosharding target, with any {@code %s} token already substituted
-   * @param watcher receives validated assignments
+   * @param initialAssignmentTimeoutNanos how long to wait for the first assignment before
+   *     reporting an error
+   * @param watcher receives validated assignments and errors
    */
   AutoshardingClient(
       String clientUuid,
@@ -134,6 +143,7 @@ final class AutoshardingClient {
       Supplier<Stopwatch> stopwatchSupplier,
       Channel channel,
       String target,
+      long initialAssignmentTimeoutNanos,
       AssignmentWatcher watcher) {
     this.clientUuid = checkNotNull(clientUuid, "clientUuid");
     this.syncContext = checkNotNull(syncContext, "syncContext");
@@ -142,13 +152,24 @@ final class AutoshardingClient {
     this.retryStopwatch = checkNotNull(stopwatchSupplier, "stopwatchSupplier").get();
     this.channel = checkNotNull(channel, "channel");
     this.target = checkNotNull(target, "target");
+    this.initialAssignmentTimeoutNanos = initialAssignmentTimeoutNanos;
     this.watcher = checkNotNull(watcher, "watcher");
   }
 
-  /** Opens the {@code WatchShardingAssignment} stream. Call once, on the sync context. */
+  /**
+   * Starts the initial assignment timer and opens the {@code WatchShardingAssignment} stream.
+   * Call once, on the sync context.
+   */
   void start() {
     syncContext.throwIfNotInThisSynchronizationContext();
     checkState(stream == null, "already started");
+    // Armed before the stream opens, so that an assignment delivered right away cancels it.
+    initialAssignmentTimer =
+        syncContext.schedule(
+            this::onInitialAssignmentTimeout,
+            initialAssignmentTimeoutNanos,
+            TimeUnit.NANOSECONDS,
+            timerService);
     startStream();
   }
 
@@ -163,6 +184,7 @@ final class AutoshardingClient {
     }
     shutdown = true;
     cancelRetryTimer();
+    cancelInitialAssignmentTimer();
     if (stream != null) {
       stream.close(Status.CANCELLED.withDescription("AutoshardingClient shutdown"));
       stream = null;
@@ -172,6 +194,32 @@ final class AutoshardingClient {
   @VisibleForTesting
   long getLatestGeneration() {
     return latestGeneration;
+  }
+
+  private void onInitialAssignmentTimeout() {
+    initialAssignmentTimer = null;
+    reportError(
+        Status.UNAVAILABLE.withDescription(
+            "autosharding: timed out waiting for the initial assignment from the sharding"
+                + " service"));
+  }
+
+  private void cancelInitialAssignmentTimer() {
+    if (initialAssignmentTimer != null) {
+      initialAssignmentTimer.cancel();
+      initialAssignmentTimer = null;
+    }
+  }
+
+  /**
+   * Reports an error unless this client has already reported an assignment, which gRFC A119 has
+   * the load balancer keep using in preference to any later error.
+   */
+  private void reportError(Status error) {
+    if (shutdown || acceptedAnyGeneration) {
+      return;
+    }
+    watcher.onError(error);
   }
 
   private void startStream() {
@@ -338,7 +386,7 @@ final class AutoshardingClient {
             "Rejecting autosharding assignment with generation {0}, no usable slices: {1}",
             new Object[] {generation, result.errorMessage});
         sendAck(generation, false, result.errorMessage);
-        watcher.onError(
+        reportError(
             Status.UNAVAILABLE.withDescription(
                 "autosharding: no usable slices in assignment with generation "
                     + generation
@@ -357,6 +405,7 @@ final class AutoshardingClient {
       latestGeneration = generation;
       acceptedAnyGeneration = true;
       receivedGoodAssignment = true;
+      cancelInitialAssignmentTimer();
       watcher.onAssignment(result.assignment);
     }
 
@@ -382,6 +431,14 @@ final class AutoshardingClient {
       bufferedChunks.clear();
       if (stream == this) {
         stream = null;
+        reportError(
+            Status.UNAVAILABLE
+                .withDescription(
+                    "autosharding: sharding service stream failed: "
+                        + status.getCode()
+                        + ": "
+                        + status.getDescription())
+                .withCause(status.getCause()));
         scheduleRetry(receivedGoodAssignment);
       }
     }

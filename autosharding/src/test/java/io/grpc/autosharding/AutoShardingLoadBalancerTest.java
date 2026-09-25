@@ -204,11 +204,56 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
-  public void unknownChannelFactoryKey_reportsTransientFailure() {
+  public void unknownChannelFactoryKey_fallbackEnabled_entersFallback() {
     Status status = deliverAddresses(config(UNKNOWN_CHANNEL_FACTORY_KEY, true), "a");
+    reportReady("a");
+
+    // Still returned, so that the resolver refreshes and the next update retries the factory.
+    assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+  }
+
+  @Test
+  public void unknownChannelFactoryKey_fallbackDisabled_failsRpcsWithTheFactoryError() {
+    Status status = deliverAddresses(config(UNKNOWN_CHANNEL_FACTORY_KEY, false), "a");
 
     assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
     assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("k").getStatus().getDescription())
+        .contains("channel factory rejected key '" + UNKNOWN_CHANNEL_FACTORY_KEY + "'");
+  }
+
+  @Test
+  public void channelFactoryFailure_closesThePreviousClientAndChannel() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+    deliverAssignment(1, slice("", "a"));
+    reportReady("a");
+
+    deliverAddresses(config(UNKNOWN_CHANNEL_FACTORY_KEY, false), "a");
+
+    assertThat(channelFactory.isReleased(0)).isTrue();
+    assertThat(channelFactory.liveCallsAtRelease).containsExactly(0);
+    // Handled like an error from a new client, so the previous assignment is not used.
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("k").getStatus().getDescription()).contains("channel factory rejected key");
+  }
+
+  @Test
+  public void channelFactoryFailure_thenRecovers_keepsTheErrorUntilTheNewClientReports()
+      throws Exception {
+    deliverAddresses(config(UNKNOWN_CHANNEL_FACTORY_KEY, false), "a");
+    reportReady("a");
+
+    Status status = deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+
+    assertThat(status.isOk()).isTrue();
+    assertThat(channelFactory.keys).containsExactly(CHANNEL_FACTORY_KEY);
+    assertThat(pick("k").getStatus().getDescription()).contains("channel factory rejected key");
+
+    deliverAssignment(1, slice("", "a"));
+
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
   }
 
   @Test
@@ -495,8 +540,9 @@ public class AutoShardingLoadBalancerTest {
     fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
 
     PickResult result = pick("k");
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
     assertThat(result.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
-    assertThat(result.getStatus().getDescription()).contains("fallback disabled");
+    assertThat(result.getStatus().getDescription()).contains("timed out");
   }
 
   @Test
@@ -536,13 +582,28 @@ public class AutoShardingLoadBalancerTest {
   }
 
   @Test
-  public void changedTarget_doesNotRestartTheInitialAssignmentTimer() throws Exception {
+  public void newChannel_timeoutOfTheNewClient_replacesThePreviousAssignment() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+    deliverAssignment(1, slice("", "a"));
+    reportReady("a");
+
+    deliverAddresses(config(OTHER_CHANNEL_FACTORY_KEY, false), "a");
+    assertThat(pickedHost(pick("k"))).isEqualTo("a");
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("k").getStatus().getDescription()).contains("timed out");
+  }
+
+  @Test
+  public void changedTarget_restartsTheInitialAssignmentTimer() throws Exception {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
     deliverAssignment(1, slice("", "a"));
 
     deliverAddresses(retargetedConfig("other-target"), "a");
 
-    assertThat(fakeClock.numPendingTasks()).isEqualTo(0);
+    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
   }
 
   @Test
@@ -555,36 +616,56 @@ public class AutoShardingLoadBalancerTest {
 
     deliverAddresses(retargetedConfig("other-target"), "a", "b");
 
+    // The previous client's error is kept until the new client reports.
     assertThat(currentState).isEqualTo(READY);
     assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
   }
 
   @Test
-  public void changedTarget_whileTimerPending_keepsTheOriginalDeadline() {
+  public void changedTarget_whileTimerPending_restartsTheDeadline() {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a");
     reportReady("a");
     fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS - 1);
 
     deliverAddresses(retargetedConfig("other-target"), "a");
-    assertThat(pick("k").getSubchannel()).isNull();
     fakeClock.forwardNanos(1);
+    assertThat(pick("k").getSubchannel()).isNull();
+
+    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS - 1);
 
     assertThat(pickedHost(pick("k"))).isEqualTo("a");
   }
 
   @Test
-  public void unusableAssignment_beforeAnyAssignment_keepsQueuingUntilTimeout() throws Exception {
+  public void unusableAssignment_beforeAnyAssignment_entersFallback() throws Exception {
     deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
     reportReady("a");
     reportReady("b");
 
     pushUnusableAssignment(1);
 
-    assertThat(currentState).isEqualTo(CONNECTING);
-    assertThat(pick("k").getSubchannel()).isNull();
-    assertThat(fakeClock.numPendingTasks()).isEqualTo(1);
+    assertThat(currentState).isEqualTo(READY);
+    assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
+  }
 
-    fakeClock.forwardNanos(ASSIGNMENT_TIMEOUT_NANOS);
+  @Test
+  public void unusableAssignment_beforeAnyAssignment_fallbackDisabled_failsRpcs() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, false), "a");
+    reportReady("a");
+
+    pushUnusableAssignment(1);
+
+    assertThat(currentState).isEqualTo(TRANSIENT_FAILURE);
+    assertThat(pick("k").getStatus().getDescription()).contains("no usable slices");
+  }
+
+  @Test
+  public void streamFailure_beforeAnyAssignment_entersFallback() throws Exception {
+    deliverAddresses(config(CHANNEL_FACTORY_KEY, true), "a", "b");
+    reportReady("a");
+    reportReady("b");
+
+    currentServerStream().onError(Status.UNAVAILABLE.asRuntimeException());
 
     assertThat(currentState).isEqualTo(READY);
     assertThat(pickedHost(pick("k"))).isAnyOf("a", "b");
