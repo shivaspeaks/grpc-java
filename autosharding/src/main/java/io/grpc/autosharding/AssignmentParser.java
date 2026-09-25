@@ -194,8 +194,8 @@ final class AssignmentParser {
           if (index < 0 || index >= endpointCount) {
             indexProblem =
                 String.format(
-                    "slice starting at %s references out-of-range endpoint index %s;"
-                        + " assignment contains %s endpoints",
+                    "slice starting at %s references out-of-range endpoint index %s"
+                        + " (assignment has %s endpoints)",
                     encode(startKey), index, endpointCount);
             break;
           }

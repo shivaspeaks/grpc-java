@@ -578,6 +578,20 @@ public class AssignmentParserTest {
     assertThat(result.errorMessage).contains("no slice");
   }
 
+  @Test
+  public void slice_mutatingReturnedKeys_doesNotAffectTheSlice() {
+    Assignment.Slice slice =
+        new Assignment.Slice(
+            "a".getBytes(StandardCharsets.UTF_8),
+            "m".getBytes(StandardCharsets.UTF_8),
+            ImmutableList.of());
+
+    slice.getStartKey()[0] = 'x';
+    slice.getEndKey()[0] = 'y';
+
+    assertSlice(slice, "a", "m");
+  }
+
   /** Parses chunks that are expected to be usable in their entirety. */
   private static Assignment parseFully(List<AssignmentChunk> chunks, long generation) {
     AssignmentParser.Result result = AssignmentParser.parse(chunks, generation);

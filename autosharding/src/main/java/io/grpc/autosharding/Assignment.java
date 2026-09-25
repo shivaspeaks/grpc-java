@@ -69,12 +69,12 @@ final class Assignment {
     }
 
     byte[] getStartKey() {
-      return startKey;
+      return startKey.clone();
     }
 
     @Nullable
     byte[] getEndKey() {
-      return endKey;
+      return endKey == null ? null : endKey.clone();
     }
 
     ImmutableList<Integer> getEndpoints() {
