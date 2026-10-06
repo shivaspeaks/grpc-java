@@ -38,6 +38,8 @@ import javax.annotation.Nullable;
  * list and sticking to the first that works.
  */
 final class PickFirstLoadBalancer extends LoadBalancer {
+  private static final PickResult CONNECTING_RESULT =
+      PickResult.withNoResult("connecting", "pick_first: attempting to connect");
   private final Helper helper;
   private Subchannel subchannel;
   private ConnectivityState currentState = IDLE;
@@ -83,7 +85,7 @@ final class PickFirstLoadBalancer extends LoadBalancer {
 
       // The channel state does not get updated when doing name resolving today, so for the moment
       // let LB report CONNECTION and call subchannel.requestConnection() immediately.
-      updateBalancingState(CONNECTING, new FixedResultPicker(PickResult.withNoResult()));
+      updateBalancingState(CONNECTING, new FixedResultPicker(connectingResult()));
       subchannel.requestConnection();
     } else {
       subchannel.updateAddresses(servers);
@@ -105,6 +107,9 @@ final class PickFirstLoadBalancer extends LoadBalancer {
   }
 
   private void processSubchannelState(Subchannel subchannel, ConnectivityStateInfo stateInfo) {
+    if (subchannel != this.subchannel) {
+      return;
+    }
     ConnectivityState newState = stateInfo.getState();
     if (newState == SHUTDOWN) {
       return;
@@ -135,7 +140,7 @@ final class PickFirstLoadBalancer extends LoadBalancer {
       case CONNECTING:
         // It's safe to use RequestConnectionPicker here, so when coming from IDLE we could leave
         // the current picker in-place. But ignoring the potential optimization is simpler.
-        picker = new FixedResultPicker(PickResult.withNoResult());
+        picker = new FixedResultPicker(connectingResult());
         break;
       case READY:
         picker = new FixedResultPicker(PickResult.withSubchannel(subchannel));
@@ -159,6 +164,7 @@ final class PickFirstLoadBalancer extends LoadBalancer {
   public void shutdown() {
     if (subchannel != null) {
       subchannel.shutdown();
+      subchannel = null;
     }
   }
 
@@ -167,6 +173,10 @@ final class PickFirstLoadBalancer extends LoadBalancer {
     if (subchannel != null) {
       subchannel.requestConnection();
     }
+  }
+
+  private PickResult connectingResult() {
+    return CONNECTING_RESULT;
   }
 
   /** Picker that requests connection during the first pick, and returns noResult. */
@@ -178,7 +188,8 @@ final class PickFirstLoadBalancer extends LoadBalancer {
       if (connectionRequested.compareAndSet(false, true)) {
         helper.getSynchronizationContext().execute(PickFirstLoadBalancer.this::requestConnection);
       }
-      return PickResult.withNoResult();
+      return PickResult.withNoResult(
+          "connecting", "pick_first: requesting connection");
     }
   }
 

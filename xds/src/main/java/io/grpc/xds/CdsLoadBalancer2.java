@@ -17,6 +17,7 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static io.grpc.ConnectivityState.CONNECTING;
 import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
 import static io.grpc.xds.XdsLbPolicies.CDS_POLICY_NAME;
 import static io.grpc.xds.XdsLbPolicies.PRIORITY_POLICY_NAME;
@@ -60,7 +61,6 @@ import io.grpc.xds.XdsEndpointResource.EdsUpdate;
 import io.grpc.xds.client.Locality;
 import io.grpc.xds.client.XdsLogger;
 import io.grpc.xds.client.XdsLogger.XdsLogLevel;
-import io.grpc.xds.internal.XdsInternalAttributes;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.ArrayList;
@@ -123,6 +123,12 @@ final class CdsLoadBalancer2 extends LoadBalancer {
             errorPrefix() + "Unable to find non-dynamic cluster"));
       }
       // The dynamic cluster must not have loaded yet
+      helper.updateBalancingState(
+          CONNECTING,
+          new FixedResultPicker(
+              PickResult.withNoResult(
+                  "cds_dynamic_discovery",
+                  "waiting for CDS resource definition for cluster " + clusterName)));
       return Status.OK;
     }
     if (!clusterConfigOr.hasValue()) {
@@ -410,7 +416,7 @@ final class CdsLoadBalancer2 extends LoadBalancer {
                     .set(io.grpc.xds.XdsAttributes.ATTR_LOCALITY_WEIGHT,
                         localityLbInfo.localityWeight())
                     .set(io.grpc.xds.XdsAttributes.ATTR_SERVER_WEIGHT, weight)
-                    .set(XdsInternalAttributes.ATTR_ADDRESS_NAME, endpoint.hostname())
+                    .set(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME, endpoint.hostname())
                     .set(AddressFilter.PATH_CHAIN_KEY, pathChain)
                     .build();
             EquivalentAddressGroup eag;

@@ -30,6 +30,7 @@ import io.grpc.ClientStreamTracer.StreamInfo;
 import io.grpc.ConnectivityState;
 import io.grpc.ConnectivityStateInfo;
 import io.grpc.EquivalentAddressGroup;
+import io.grpc.InternalEquivalentAddressGroup;
 import io.grpc.InternalLogId;
 import io.grpc.LoadBalancer;
 import io.grpc.Metadata;
@@ -53,7 +54,6 @@ import io.grpc.xds.client.Locality;
 import io.grpc.xds.client.XdsClient;
 import io.grpc.xds.client.XdsLogger;
 import io.grpc.xds.client.XdsLogger.XdsLogLevel;
-import io.grpc.xds.internal.XdsInternalAttributes;
 import io.grpc.xds.internal.security.SecurityProtocolNegotiators;
 import io.grpc.xds.internal.security.SslContextProviderSupplier;
 import io.grpc.xds.orca.OrcaPerRequestUtil;
@@ -196,7 +196,8 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
   private final class ClusterImplLbHelper extends ForwardingLoadBalancerHelper {
     private final AtomicLong inFlights;
     private ConnectivityState currentState = ConnectivityState.IDLE;
-    private SubchannelPicker currentPicker = new FixedResultPicker(PickResult.withNoResult());
+    private SubchannelPicker currentPicker = new FixedResultPicker(
+        PickResult.withNoResult("connecting", "cluster_impl: initializing"));
     private List<DropOverload> dropPolicies = Collections.emptyList();
     private long maxConcurrentRequests = DEFAULT_PER_CLUSTER_MAX_CONCURRENT_REQUESTS;
     @Nullable
@@ -239,7 +240,7 @@ final class ClusterImplLoadBalancer extends LoadBalancer {
           .set(ATTR_CLUSTER_LOCALITY, localityAtomicReference);
       if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_AUTHORITY_REWRITE", false)) {
         String hostname = args.getAddresses().get(0).getAttributes()
-            .get(XdsInternalAttributes.ATTR_ADDRESS_NAME);
+            .get(InternalEquivalentAddressGroup.ATTR_ADDRESS_NAME);
         if (hostname != null) {
           attrsBuilder.set(ATTR_SUBCHANNEL_ADDRESS_NAME, hostname);
         }

@@ -40,6 +40,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.ArgumentMatchers.same;
@@ -81,6 +82,7 @@ import io.grpc.CompositeChannelCredentials;
 import io.grpc.ConnectivityState;
 import io.grpc.ConnectivityStateInfo;
 import io.grpc.Context;
+import io.grpc.Deadline;
 import io.grpc.EquivalentAddressGroup;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.IntegerMarshaller;
@@ -499,7 +501,10 @@ public class ManagedChannelImplTest {
 
   @Test
   public void childChannelConfigurator_passedToNameResolverArgs() {
-    ChannelConfigurator configurator = builder -> { };
+    final boolean[] configuratorInvoked = new boolean[1];
+    ChannelConfigurator configurator = builder -> {
+      configuratorInvoked[0] = true;
+    };
     channelBuilder.childChannelConfigurator(configurator);
     AtomicReference<NameResolver.Args> actualArgs = new AtomicReference<>();
     channelBuilder.nameResolverRegistry.register(new NameResolverProvider() {
@@ -528,12 +533,18 @@ public class ManagedChannelImplTest {
     });
     createChannel();
     assertNotNull(actualArgs.get());
-    assertSame(configurator, actualArgs.get().getChildChannelConfigurator());
+    ChannelConfigurator childConfigurator = actualArgs.get().getChildChannelConfigurator();
+    assertNotNull(childConfigurator);
+    childConfigurator.configureChannelBuilder(channelBuilder);
+    assertTrue(configuratorInvoked[0]);
   }
 
   @Test
   public void childChannelConfigurator_passedToResolvingOobChannelNameResolverArgs() {
-    ChannelConfigurator configurator = builder -> { };
+    final boolean[] configuratorInvoked = new boolean[1];
+    ChannelConfigurator configurator = builder -> {
+      configuratorInvoked[0] = true;
+    };
     channelBuilder.childChannelConfigurator(configurator);
     AtomicReference<NameResolver.Args> oobArgs = new AtomicReference<>();
     channelBuilder.nameResolverRegistry.register(new NameResolverProvider() {
@@ -567,7 +578,10 @@ public class ManagedChannelImplTest {
     ManagedChannel oob = helper.createResolvingOobChannelBuilder("oobauthority").build();
     oob.getState(true);
     assertNotNull(oobArgs.get());
-    assertSame(configurator, oobArgs.get().getChildChannelConfigurator());
+    ChannelConfigurator childConfigurator = oobArgs.get().getChildChannelConfigurator();
+    assertNotNull(childConfigurator);
+    childConfigurator.configureChannelBuilder(channelBuilder);
+    assertTrue(configuratorInvoked[0]);
     oob.shutdownNow();
   }
 
@@ -4812,6 +4826,46 @@ public class ManagedChannelImplTest {
         });
   }
 
+  @Test
+  public void oobChannelTermination_doesNotCloseSharedTransportFactory() {
+    channelBuilder.nameResolverRegistry.register(new NameResolverProvider() {
+      @Override
+      public NameResolver newNameResolver(URI targetUri, NameResolver.Args args) {
+        NameResolver resolver = mock(NameResolver.class);
+        when(resolver.getServiceAuthority()).thenReturn(
+            targetUri.getAuthority() != null ? targetUri.getAuthority() : targetUri.getPath());
+        return resolver;
+      }
+
+      @Override
+      public String getDefaultScheme() {
+        return expectedUri.getScheme();
+      }
+
+      @Override
+      protected boolean isAvailable() {
+        return true;
+      }
+
+      @Override
+      protected int priority() {
+        return 10;
+      }
+    });
+    createChannel();
+    ManagedChannel oob = helper.createResolvingOobChannelBuilder("oobauthority").build();
+
+    // Shutting down OOB channel should release its reference but not close the
+    // shared transport factory
+    oob.shutdownNow();
+    verify(mockTransportFactory, never()).close();
+
+    // Terminating the main channel releases the final reference and closes the
+    // transport factory
+    channel.shutdownNow();
+    verify(mockTransportFactory).close();
+  }
+
   @SuppressWarnings("unchecked")
   private static Map<String, Object> parseConfig(String json) throws Exception {
     return (Map<String, Object>) JsonParser.parse(json);
@@ -4822,5 +4876,211 @@ public class ManagedChannelImplTest {
     // Provides dummy variable for retry related params (not used in this test class)
     return ManagedChannelServiceConfig
         .fromServiceConfig(rawServiceConfig, true, 3, 4, policySelection);
+  }
+
+  @Test
+  public void callDelay_normalDeferredResolution() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
+    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+    call.start(mockCallListener, new Metadata());
+
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+
+    nsFactory.allResolved();
+
+    verify(mockTracerFactory).recordDelayEnd("resolving");
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_immediateResolution() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(true).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
+    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+    call.start(mockCallListener, new Metadata());
+
+    channel.syncContext.execute(new Runnable() {
+      @Override
+      public void run() {}
+    });
+
+    verify(mockTracerFactory, never()).recordDelayStart(anyString(), anyString());
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_cancellationWhileQueued() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
+    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+    call.start(mockCallListener, new Metadata());
+
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+
+    call.cancel("Cancelled while queued", null);
+
+    verify(mockTracerFactory).recordDelayEnd("resolving");
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_deadlineExpirationWhileQueued() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT
+        .withStreamTracerFactory(mockTracerFactory)
+        .withDeadline(Deadline.after(100, TimeUnit.MILLISECONDS, timer.getDeadlineTicker()));
+    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+    call.start(mockCallListener, new Metadata());
+
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+
+    timer.forwardTime(101, TimeUnit.MILLISECONDS);
+
+    verify(mockTracerFactory).recordDelayEnd("resolving");
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_resolutionFailure() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false)
+        .setError(Status.UNAVAILABLE.withDescription("Simulated resolver failure"))
+        .build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
+    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+    call.start(mockCallListener, new Metadata());
+
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+
+    nsFactory.allResolved();
+
+    verify(mockTracerFactory).recordDelayEnd("resolving");
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_forcefulShutdown() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
+    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+    call.start(mockCallListener, new Metadata());
+
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+
+    channel.shutdownNow();
+
+    verify(mockTracerFactory).recordDelayEnd("resolving");
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_cancelledBeforeQueuedOnSyncContext() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
+
+    channel.syncContext.execute(() -> {
+      ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+      call.cancel("Cancelled before syncContext drains", null);
+    });
+
+    verify(mockTracerFactory, never()).recordDelayStart(anyString(), anyString());
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
+    executor.runDueTasks();
+  }
+
+  @Test
+  public void callDelay_callCancelledDuringTracerIteration_abortsLoop() {
+    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
+        .setResolvedAtStart(false).build();
+    channelBuilder.nameResolverFactory(nsFactory);
+    createChannel();
+
+    final AtomicReference<ClientCall<?, ?>> callRef = new AtomicReference<>();
+    ClientStreamTracer.Factory tracer1 = new ClientStreamTracer.Factory() {
+      @Override
+      public ClientStreamTracer newClientStreamTracer(StreamInfo info, Metadata headers) {
+        return new ClientStreamTracer() {};
+      }
+
+      @Override
+      public void recordDelayStart(String delayType, String delayReason) {
+        callRef.get().cancel("Cancel inside first tracer start", null);
+      }
+    };
+    ClientStreamTracer.Factory tracer2 = mock(ClientStreamTracer.Factory.class);
+    when(tracer2.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+
+    CallOptions callOptions = CallOptions.DEFAULT
+        .withStreamTracerFactory(tracer1)
+        .withStreamTracerFactory(tracer2);
+
+    channel.syncContext.execute(() -> {
+      ClientCall<String, Integer> call = channel.newCall(method, callOptions);
+      callRef.set(call);
+    });
+
+    verify(tracer2, never()).recordDelayStart(anyString(), anyString());
+    executor.runDueTasks();
   }
 }

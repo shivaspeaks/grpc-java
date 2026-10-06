@@ -22,7 +22,7 @@ import static io.grpc.internal.GrpcUtil.IMPLEMENTATION_VERSION;
 import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.BAGGAGE_KEY;
 
 import com.google.common.annotations.VisibleForTesting;
-import io.grpc.Attributes;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -37,10 +37,13 @@ import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.ServerStreamTracer;
+import io.grpc.Status;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.opentelemetry.internal.OpenTelemetryConstants;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.baggage.Baggage;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
@@ -142,6 +145,10 @@ final class OpenTelemetryTracingModule {
     volatile int callEnded;
     private final Span clientSpan;
     private final String fullMethodName;
+    @GuardedBy("this")
+    @Nullable private Span activeCallDelaySpan;
+    @GuardedBy("this")
+    @Nullable private String activeCallDelayType;
 
     CallAttemptsTracerFactory(Span clientSpan, MethodDescriptor<?, ?> method) {
       checkNotNull(method, "method");
@@ -166,6 +173,13 @@ final class OpenTelemetryTracingModule {
       return new ClientTracer(attemptSpan, clientSpan);
     }
 
+    private boolean isCallEnded() {
+      if (callEndedUpdater != null) {
+        return callEndedUpdater.get(this) != 0;
+      }
+      return callEnded != 0;
+    }
+
     /**
      * Record a finished call and mark the current time as the end time.
      *
@@ -183,7 +197,60 @@ final class OpenTelemetryTracingModule {
         }
         callEnded = 1;
       }
+      synchronized (this) {
+        endActiveDelaySpan();
+      }
       endSpanWithStatus(clientSpan, status);
+    }
+
+    @Override
+    public void recordDelayStart(String delayType, String delayReason) {
+      if (isCallEnded()) {
+        return;
+      }
+      synchronized (this) {
+        if (isCallEnded()) {
+          return;
+        }
+        if (activeCallDelaySpan != null && delayType.equals(activeCallDelayType)) {
+          addDelayEvent(activeCallDelaySpan, delayReason);
+          return;
+        }
+        endActiveDelaySpan();
+        activeCallDelayType = delayType;
+        activeCallDelaySpan = otelTracer.spanBuilder("Delay")
+            .setParent(Context.current().with(clientSpan))
+            .setAttribute("grpc.delay_type", delayType)
+            .startSpan();
+        addDelayEvent(activeCallDelaySpan, delayReason);
+      }
+    }
+
+    @Override
+    public void recordDelayReasonChanged(String delayType, String delayReason) {
+      if (isCallEnded()) {
+        return;
+      }
+      synchronized (this) {
+        if (isCallEnded() || activeCallDelaySpan == null) {
+          return;
+        }
+        addDelayEvent(activeCallDelaySpan, delayReason);
+      }
+    }
+
+    @Override
+    public synchronized void recordDelayEnd(String delayType) {
+      endActiveDelaySpan();
+    }
+
+    @GuardedBy("this")
+    private void endActiveDelaySpan() {
+      if (activeCallDelaySpan != null) {
+        activeCallDelaySpan.end();
+        activeCallDelaySpan = null;
+        activeCallDelayType = null;
+      }
     }
   }
 
@@ -192,6 +259,12 @@ final class OpenTelemetryTracingModule {
     private final Span parentSpan;
     volatile int seqNo;
     boolean isPendingStream;
+    @GuardedBy("this")
+    @Nullable private Span activeDelaySpan;
+    @GuardedBy("this")
+    @Nullable private String activeDelayType;
+    @GuardedBy("this")
+    private boolean streamClosed;
 
     ClientTracer(Span span, Span parentSpan) {
       this.span = checkNotNull(span, "span");
@@ -199,7 +272,10 @@ final class OpenTelemetryTracingModule {
     }
 
     @Override
-    public void streamCreated(Attributes transportAtts, Metadata headers) {
+    public void streamCreated(io.grpc.Attributes transportAtts, Metadata headers) {
+      synchronized (this) {
+        endActiveDelaySpan();
+      }
       contextPropagators.getTextMapPropagator().inject(Context.current().with(span), headers,
           metadataSetter);
       if (isPendingStream) {
@@ -210,6 +286,47 @@ final class OpenTelemetryTracingModule {
     @Override
     public void createPendingStream() {
       isPendingStream = true;
+    }
+
+    @Override
+    public synchronized void recordDelayStart(String delayType, String delayReason) {
+      if (streamClosed) {
+        return;
+      }
+      if (activeDelaySpan != null && delayType.equals(activeDelayType)) {
+        // Do not recreate the span if the delay type is unchanged (e.g., priority failover).
+        addDelayEvent(activeDelaySpan, delayReason);
+        return;
+      }
+      endActiveDelaySpan();
+      activeDelayType = delayType;
+      activeDelaySpan = otelTracer.spanBuilder("Delay")
+          .setParent(Context.current().with(span))
+          .setAttribute("grpc.delay_type", delayType)
+          .startSpan();
+      addDelayEvent(activeDelaySpan, delayReason);
+    }
+
+    @Override
+    public synchronized void recordDelayReasonChanged(String delayType, String delayReason) {
+      if (streamClosed || activeDelaySpan == null) {
+        return;
+      }
+      addDelayEvent(activeDelaySpan, delayReason);
+    }
+
+    @Override
+    public synchronized void recordDelayEnd(String delayType) {
+      endActiveDelaySpan();
+    }
+
+    @GuardedBy("this")
+    private void endActiveDelaySpan() {
+      if (activeDelaySpan != null) {
+        activeDelaySpan.end();
+        activeDelaySpan = null;
+        activeDelayType = null;
+      }
     }
 
     @Override
@@ -237,7 +354,12 @@ final class OpenTelemetryTracingModule {
     }
 
     @Override
-    public void streamClosed(io.grpc.Status status) {
+    public synchronized void streamClosed(Status status) {
+      if (streamClosed) {
+        return;
+      }
+      streamClosed = true;
+      endActiveDelaySpan();
       endSpanWithStatus(span, status);
     }
   }
@@ -396,6 +518,13 @@ final class OpenTelemetryTracingModule {
         delegate().onReady();
       }
     }
+
+    @Override
+    public void onEvent(Object event) {
+      try (Scope scope = context.makeCurrent()) {
+        delegate().onEvent(event);
+      }
+    }
   }
 
   @VisibleForTesting
@@ -453,9 +582,15 @@ final class OpenTelemetryTracingModule {
   // Receiving:
   // |-- Event 'Inbound message received', attributes('sequence-numer' = 0,
   //                                                  'message-size' = 7854) ----|
+  private static void addDelayEvent(Span delaySpan, String delayReason) {
+    delaySpan.addEvent(
+        "Delay triggered",
+        Attributes.of(AttributeKey.stringKey("grpc.delay_reason"), delayReason));
+  }
+
   private void recordOutboundMessageSentEvent(Span span,
       int seqNo, long optionalWireSize, long optionalUncompressedSize) {
-    AttributesBuilder attributesBuilder = io.opentelemetry.api.common.Attributes.builder();
+    AttributesBuilder attributesBuilder = Attributes.builder();
     attributesBuilder.put("sequence-number", seqNo);
     if (optionalUncompressedSize != -1) {
       attributesBuilder.put("message-size", optionalUncompressedSize);
@@ -467,14 +602,14 @@ final class OpenTelemetryTracingModule {
   }
 
   private void recordInboundCompressedMessage(Span span, int seqNo, long optionalWireSize) {
-    AttributesBuilder attributesBuilder = io.opentelemetry.api.common.Attributes.builder();
+    AttributesBuilder attributesBuilder = Attributes.builder();
     attributesBuilder.put("sequence-number", seqNo);
     attributesBuilder.put("message-size-compressed", optionalWireSize);
     span.addEvent("Inbound compressed message", attributesBuilder.build());
   }
 
   private void recordInboundMessageSize(Span span, int seqNo, long bytes) {
-    AttributesBuilder attributesBuilder = io.opentelemetry.api.common.Attributes.builder();
+    AttributesBuilder attributesBuilder = Attributes.builder();
     attributesBuilder.put("sequence-number", seqNo);
     attributesBuilder.put("message-size", bytes);
     span.addEvent("Inbound message", attributesBuilder.build());

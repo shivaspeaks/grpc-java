@@ -147,8 +147,10 @@ public class PickFirstLoadBalancerTest {
     verify(mockSubchannel).requestConnection();
 
     // Calling pickSubchannel() twice gave the same result
-    assertEquals(pickerCaptor.getValue().pickSubchannel(mockArgs),
-        pickerCaptor.getValue().pickSubchannel(mockArgs));
+    PickResult result = pickerCaptor.getValue().pickSubchannel(mockArgs);
+    assertThat(result.getDelayType()).isEqualTo("connecting");
+    assertThat(result.getDelayReason()).isEqualTo("pick_first: attempting to connect");
+    assertEquals(result, pickerCaptor.getValue().pickSubchannel(mockArgs));
 
     verifyNoMoreInteractions(mockHelper);
   }
@@ -587,6 +589,29 @@ public class PickFirstLoadBalancerTest {
     verify(mockSubchannel).requestConnection();
     loadBalancer.requestConnection();
     verify(mockSubchannel, times(2)).requestConnection();
+  }
+
+  @Test
+  public void ignoreStaleSubchannelStateChange() throws Exception {
+    loadBalancer.acceptResolvedAddresses(
+        ResolvedAddresses.newBuilder().setAddresses(servers).setAttributes(affinity).build());
+    verify(mockSubchannel).start(stateListenerCaptor.capture());
+    SubchannelStateListener oldListener = stateListenerCaptor.getValue();
+
+    // Name resolution error occurs, shutting down old subchannel and resetting subchannel reference
+    loadBalancer.handleNameResolutionError(Status.UNAVAILABLE);
+
+    // New resolution result arrives, creating a new subchannel
+    Subchannel newSubchannel = org.mockito.Mockito.mock(Subchannel.class);
+    when(mockHelper.createSubchannel(any())).thenReturn(newSubchannel);
+    loadBalancer.acceptResolvedAddresses(
+        ResolvedAddresses.newBuilder().setAddresses(servers).setAttributes(affinity).build());
+
+    // Old subchannel (e.g. during delayed shutdown) fires READY state update
+    oldListener.onSubchannelState(ConnectivityStateInfo.forNonError(READY));
+
+    // Verify that the LB state was NOT updated to READY with the old subchannel
+    verify(mockHelper, never()).updateBalancingState(eq(READY), any(SubchannelPicker.class));
   }
 
   private static class FakeSocketAddress extends SocketAddress {

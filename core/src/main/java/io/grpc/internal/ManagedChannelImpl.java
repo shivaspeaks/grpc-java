@@ -173,7 +173,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
   private final NameResolverProvider nameResolverProvider;
   private final NameResolver.Args nameResolverArgs;
   private final LoadBalancerProvider loadBalancerFactory;
-  private final ClientTransportFactory originalTransportFactory;
+  private final RefCountedClientTransportFactory originalTransportFactory;
   @Nullable
   private final ChannelCredentials originalChannelCreds;
   private final ClientTransportFactory transportFactory;
@@ -433,6 +433,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
     // which are bugs.
     shutdownNameResolverAndLoadBalancer(true);
     delayedTransport.reprocess(null);
+    realChannel.updateConfigSelector(INITIAL_PENDING_SELECTOR);
     channelLogger.log(ChannelLogLevel.INFO, "Entering IDLE state");
     channelStateManager.gotoState(IDLE);
     // If the inUseStateAggregator still considers pending calls to be queued up or the delayed
@@ -562,11 +563,15 @@ final class ManagedChannelImpl extends ManagedChannel implements
     this.executorPool = checkNotNull(builder.executorPool, "executorPool");
     this.executor = checkNotNull(executorPool.getObject(), "executor");
     this.originalChannelCreds = builder.channelCredentials;
-    this.originalTransportFactory = clientTransportFactory;
+    if (clientTransportFactory instanceof RefCountedClientTransportFactory) {
+      this.originalTransportFactory = (RefCountedClientTransportFactory) clientTransportFactory;
+    } else {
+      this.originalTransportFactory = new RefCountedClientTransportFactory(clientTransportFactory);
+    }
     this.offloadExecutorHolder =
         new ExecutorHolder(checkNotNull(builder.offloadExecutorPool, "offloadExecutorPool"));
     this.transportFactory = new CallCredentialsApplyingTransportFactory(
-        clientTransportFactory, builder.callCredentials, this.offloadExecutorHolder);
+        originalTransportFactory, builder.callCredentials, this.offloadExecutorHolder);
     this.scheduledExecutor =
         new RestrictedScheduledExecutor(transportFactory.getScheduledExecutorService());
     maxTraceEvents = builder.maxTraceEvents;
@@ -918,6 +923,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
               inUseStateAggregator.updateObjectInUse(pendingCallsInUseObject, true);
             }
             pendingCalls.add(pendingCall);
+            pendingCall.notifyQueuedForNameResolution();
           } else {
             pendingCall.reprocess();
           }
@@ -930,7 +936,8 @@ final class ManagedChannelImpl extends ManagedChannel implements
     void updateConfigSelector(@Nullable InternalConfigSelector config) {
       InternalConfigSelector prevConfig = configSelector.get();
       configSelector.set(config);
-      if (prevConfig == INITIAL_PENDING_SELECTOR && pendingCalls != null) {
+      if (prevConfig == INITIAL_PENDING_SELECTOR
+          && config != INITIAL_PENDING_SELECTOR && pendingCalls != null) {
         for (RealChannel.PendingCall<?, ?> pendingCall : pendingCalls) {
           pendingCall.reprocess();
         }
@@ -997,6 +1004,10 @@ final class ManagedChannelImpl extends ManagedChannel implements
       final MethodDescriptor<ReqT, RespT> method;
       final CallOptions callOptions;
       private final long callCreationTime;
+      @GuardedBy("this")
+      private boolean queuedForResolution;
+      @GuardedBy("this")
+      private boolean delayEnded;
 
       PendingCall(Context context, MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
         super(
@@ -1010,8 +1021,35 @@ final class ManagedChannelImpl extends ManagedChannel implements
         this.callCreationTime = ticker.nanoTime();
       }
 
+      private synchronized void notifyQueuedForNameResolution() {
+        if (delayEnded || queuedForResolution) {
+          return;
+        }
+        queuedForResolution = true;
+        for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+          if (delayEnded) {
+            break;
+          }
+          factory.recordDelayStart(
+              "resolving", "waiting for name resolution or service config");
+        }
+      }
+
+      private synchronized void endDelayIfNeeded() {
+        if (delayEnded) {
+          return;
+        }
+        delayEnded = true;
+        if (queuedForResolution) {
+          for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+            factory.recordDelayEnd("resolving");
+          }
+        }
+      }
+
       /** Called when it's ready to create a real call and reprocess the pending call. */
       void reprocess() {
+        endDelayIfNeeded();
         ClientCall<ReqT, RespT> realCall;
         Context previous = context.attach();
         try {
@@ -1037,6 +1075,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
 
       @Override
       protected void callCancelled() {
+        endDelayIfNeeded();
         super.callCancelled();
         syncContext.execute(new PendingCallRemoval());
       }
@@ -1462,7 +1501,10 @@ final class ManagedChannelImpl extends ManagedChannel implements
           final ClientTransportFactory transportFactory;
           CallCredentials callCredentials;
           if (channelCreds instanceof DefaultChannelCreds) {
-            transportFactory = originalTransportFactory;
+            // TODO(kannanjgithub) We should eventually refactor ManagedChannelImplBuilder so
+            // callCredentials can be resolved lazily at build() time, allowing transport factory
+            // retention to happen strictly inside buildClientTransportFactory().
+            transportFactory = originalTransportFactory.retain();
             callCredentials = null;
           } else {
             SwapChannelCredentialsResult swapResult =

@@ -39,6 +39,7 @@ import io.grpc.LoadBalancer;
 import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
+import io.grpc.util.LazyLoadBalancer;
 import io.grpc.util.MultiChildLoadBalancer;
 import io.grpc.xds.ThreadSafeRandom.ThreadSafeRandomImpl;
 import io.grpc.xds.client.XdsLogger;
@@ -356,6 +357,8 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
   }
 
   private static final class RingHashPicker extends SubchannelPicker {
+    private static final PickResult RING_HASH_CONNECTING_RESULT =
+        PickResult.withNoResult("connecting", "ring_hash: waiting for connection");
     private final SynchronizationContext syncContext;
     private final List<RingEntry> ring;
     // Avoid synchronization between pickSubchannel and subchannel's connectivity state change,
@@ -453,7 +456,7 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
           // RPCs can be buffered if the next subchannel is pending (per A62). Otherwise, RPCs
           // are failed unless there is a READY connection.
           if (subchannelView.connectivityState == CONNECTING) {
-            return PickResult.withNoResult();
+            return RING_HASH_CONNECTING_RESULT;
           }
 
           if (subchannelView.connectivityState == IDLE) {
@@ -463,7 +466,8 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
               }
             });
 
-            return PickResult.withNoResult(); // Indicates that this should be retried after backoff
+            // Indicates that this should be retried after backoff
+            return RING_HASH_CONNECTING_RESULT;
           }
         }
       } else {
@@ -487,7 +491,7 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
           }
         }
         if (requestedConnection) {
-          return PickResult.withNoResult();
+          return RING_HASH_CONNECTING_RESULT;
         }
       }
 

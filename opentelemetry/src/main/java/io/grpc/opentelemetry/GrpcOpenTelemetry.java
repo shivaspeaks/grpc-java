@@ -232,6 +232,29 @@ public final class GrpcOpenTelemetry {
               .build());
     }
 
+    if (isMetricEnabled("grpc.client.attempt.delay.duration", enableMetrics, disableDefault)) {
+      builder.clientAttemptDelayCounter(
+          meter.histogramBuilder(
+                  "grpc.client.attempt.delay.duration")
+              .setUnit("s")
+              .setDescription(
+                  "EXPERIMENTAL. Time an RPC attempt spent waiting for a load balancing pick"
+                      + " or connection establishment.")
+              .setExplicitBucketBoundariesAdvice(LATENCY_BUCKETS)
+              .build());
+    }
+
+    if (isMetricEnabled("grpc.client.call.delay.duration", enableMetrics, disableDefault)) {
+      builder.clientCallDelayCounter(
+          meter.histogramBuilder(
+                  "grpc.client.call.delay.duration")
+              .setUnit("s")
+              .setDescription(
+                  "EXPERIMENTAL. Time an RPC spent waiting at the call level before an attempt was"
+                      + " initiated, such as waiting for name resolution.")
+              .setExplicitBucketBoundariesAdvice(LATENCY_BUCKETS)
+              .build());
+    }
     if (isMetricEnabled("grpc.client.attempt.sent_total_compressed_message_size", enableMetrics,
         disableDefault)) {
       builder.clientTotalSentCompressedMessageSizeCounter(
