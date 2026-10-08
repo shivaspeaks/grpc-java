@@ -23,6 +23,8 @@ import io.grpc.ChannelLogger;
 import io.grpc.Internal;
 import io.grpc.InternalChannelz;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.codec.AdaptiveCumulator;
+import io.netty.handler.codec.ByteToMessageDecoder.Cumulator;
 import io.netty.handler.codec.http2.Http2ConnectionDecoder;
 import io.netty.handler.codec.http2.Http2ConnectionEncoder;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
@@ -34,6 +36,16 @@ import javax.annotation.Nullable;
  */
 @Internal
 public abstract class GrpcHttp2ConnectionHandler extends Http2ConnectionHandler {
+  static final int ADAPTIVE_CUMULATOR_COMPOSE_MIN_SIZE_DEFAULT = 1024;
+  static final Cumulator ADAPTIVE_CUMULATOR =
+      new AdaptiveCumulator(ADAPTIVE_CUMULATOR_COMPOSE_MIN_SIZE_DEFAULT);
+  // TEMPORARY: A/B switches for benchmarking only. Remove before enabling unconditionally.
+  private static final boolean USE_ADAPTIVE_CUMULATOR =
+      Boolean.getBoolean("io.grpc.netty.useAdaptiveCumulator");
+  @Nullable
+  static final Integer MAX_FRAME_SIZE =
+      Integer.getInteger("io.grpc.netty.maxFrameSize");
+
   @Nullable
   protected final ChannelPromise channelUnused;
   private final ChannelLogger negotiationLogger;
@@ -48,6 +60,12 @@ public abstract class GrpcHttp2ConnectionHandler extends Http2ConnectionHandler 
     super(decoder, encoder, initialSettings);
     this.channelUnused = channelUnused;
     this.negotiationLogger = negotiationLogger;
+    if (USE_ADAPTIVE_CUMULATOR) {
+      setCumulator(ADAPTIVE_CUMULATOR);
+    }
+    if (MAX_FRAME_SIZE != null) {
+      initialSettings.maxFrameSize(MAX_FRAME_SIZE);
+    }
   }
 
   /**

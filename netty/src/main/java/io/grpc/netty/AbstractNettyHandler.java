@@ -50,7 +50,8 @@ abstract class AbstractNettyHandler extends GrpcHttp2ConnectionHandler {
   private final Ticker ticker;
 
   private static final long BDP_MEASUREMENT_PING = 1234;
-  protected static final int MIN_ALLOCATED_CHUNK = 16 * 1024;
+  protected static final int MIN_ALLOCATED_CHUNK =
+      MAX_FRAME_SIZE != null ? MAX_FRAME_SIZE : 16 * 1024;
 
   AbstractNettyHandler(
       ChannelPromise channelUnused,
